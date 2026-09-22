@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hackbot"
-version = "1.2.4"
+version = "1.2.5"
 description = "HackBot — Production-ready AI cybersecurity assistant with Agent, Chat & Planning modes"
 readme = "README.md"
 license = {text = "MIT"}
@@ -115,6 +115,6 @@ line-length = 100
 target-version = ["py39"]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true

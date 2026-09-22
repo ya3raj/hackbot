@@ -494,3 +494,81 @@ class TestTopologyParser:
         assert hosts[0].hostname == "fileserver.local"
         assert hosts[0].os == "Linux 5.x"
         assert len(hosts[0].ports) == 2
+
+    def test_render_mermaid(self):
+        """Test Mermaid graph rendering."""
+        parser = TopologyParser()
+        topo = parser.parse_nmap_text(SAMPLE_NMAP_OUTPUT)
+        mermaid = parser.render_mermaid(topo)
+        assert mermaid.startswith("```mermaid")
+        assert "graph TD" in mermaid
+        assert "classDef scanner" in mermaid
+        assert "classDef host" in mermaid
+        assert "scanner -->" in mermaid
+        assert "192.168.1.1" in mermaid
+        assert topo.to_mermaid() == mermaid
+
+    def test_mermaid_empty_topology(self):
+        from hackbot.core.topology import NetworkTopology
+        topo = NetworkTopology()
+        mermaid = TopologyParser.render_mermaid(topo)
+        assert "```mermaid" in mermaid
+        assert "(No hosts discovered)" in mermaid
+
+
+class TestCVSSCalculator:
+    """Tests for FIRST CVSS v3.1 calculator and vector parser."""
+
+    def test_critical_base_score(self):
+        from hackbot.core.cve import CVSSCalculator
+
+        vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+        res = CVSSCalculator.calculate(vector)
+        assert res.base_score == 9.8
+        assert res.severity == "Critical"
+        assert res.metrics["AV"] == "N"
+        assert res.metrics["S"] == "U"
+        assert res.impact_subscore == 5.9
+        assert res.exploitability_subscore == 3.9
+
+    def test_scope_changed_base_score(self):
+        from hackbot.core.cve import CVSSCalculator
+
+        vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
+        res = CVSSCalculator.calculate(vector)
+        assert res.base_score == 10.0
+        assert res.severity == "Critical"
+
+    def test_vector_without_prefix(self):
+        from hackbot.core.cve import CVSSCalculator
+
+        vector = "AV:L/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N"
+        res = CVSSCalculator.calculate(vector)
+        assert res.base_score < 4.0
+        assert res.severity == "Low"
+        assert "Attack Vector: Local" in res.descriptions["AV"]
+
+    def test_missing_metrics_raises_error(self):
+        from hackbot.core.cve import CVSSCalculator
+
+        with pytest.raises(ValueError, match="Missing required CVSS v3.1 metrics"):
+            CVSSCalculator.calculate("CVSS:3.1/AV:N/AC:L/PR:N")
+
+    def test_invalid_metric_value_raises_error(self):
+        from hackbot.core.cve import CVSSCalculator
+
+        with pytest.raises(ValueError, match="Invalid value 'X' for CVSS metric AV"):
+            CVSSCalculator.calculate("CVSS:3.1/AV:X/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+
+    def test_result_to_dict_and_summary(self):
+        from hackbot.core.cve import CVSSCalculator
+
+        vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+        res = CVSSCalculator.calculate(vector)
+        d = res.to_dict()
+        assert d["base_score"] == 9.8
+        assert d["severity"] == "Critical"
+        summary = res.summary()
+        assert "9.8 (Critical)" in summary
+        assert "Attack Vector" in summary
+

@@ -136,7 +136,7 @@ class OSINTReport:
 
 # ── Technology Fingerprints ──────────────────────────────────────────────────
 
-TECH_FINGERPRINTS = {
+TECH_FINGERPRINTS: Dict[str, Any] = {
     # Headers
     "headers": {
         "X-Powered-By": {
@@ -337,7 +337,7 @@ class OSINTEngine:
                     rtype = "A" if family == socket.AF_INET else "AAAA"
                     key = (rtype, ip)
                     if key not in seen:
-                        records.append(DNSRecord(record_type=rtype, value=ip))
+                        records.append(DNSRecord(record_type=rtype, value=str(ip)))
                         seen.add(key)
             except socket.gaierror:
                 pass
@@ -494,9 +494,10 @@ class OSINTEngine:
         ]
         for query in search_queries:
             try:
+                search_params: Dict[str, Any] = {"q": query, "num": 20}
                 resp = self._session.get(
                     "https://www.google.com/search",
-                    params={"q": query, "num": 20},
+                    params=search_params,
                     timeout=self.timeout,
                 )
                 if resp.ok:
@@ -612,7 +613,7 @@ class OSINTEngine:
     def _check_ssl(self, url: str, result: TechStackResult) -> None:
         """Check SSL/TLS certificate info."""
         parsed = urlparse(url)
-        if parsed.scheme != "https":
+        if parsed.scheme != "https" or not parsed.hostname:
             return
 
         try:
@@ -624,7 +625,12 @@ class OSINTEngine:
                 s.connect((parsed.hostname, 443))
                 cert = s.getpeercert()
                 if cert:
-                    issuer = dict(x[0] for x in cert.get("issuer", []))
+                    issuer_pairs: List[tuple[str, str]] = []
+                    for rdn in cert.get("issuer", ()):
+                        for item in rdn:
+                            if isinstance(item, (list, tuple)) and len(item) == 2:
+                                issuer_pairs.append((str(item[0]), str(item[1])))
+                    issuer = dict(issuer_pairs)
                     org = issuer.get("organizationName", "")
                     if org:
                         result.technologies.append({
@@ -697,8 +703,8 @@ class OSINTEngine:
 
         # Summary
         lines.append("## 📊 Summary\n")
-        lines.append(f"| Metric | Count |")
-        lines.append(f"|--------|-------|")
+        lines.append("| Metric | Count |")
+        lines.append("|--------|-------|")
         lines.append(f"| Subdomains | {len(report.subdomains)} |")
         lines.append(f"| DNS Records | {len(report.dns_records)} |")
         lines.append(f"| Emails | {len(report.emails)} |")

@@ -6,7 +6,6 @@ Manages LLM interactions with support for multiple providers (OpenAI, Ollama, et
 
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -17,7 +16,7 @@ from hackbot.config import AIConfig
 
 # ── Provider Registry ────────────────────────────────────────────────────────
 
-PROVIDERS = {
+PROVIDERS: Dict[str, Dict[str, Any]] = {
     "openai": {
         "name": "OpenAI",
         "base_url": "https://api.openai.com/v1",
@@ -439,7 +438,7 @@ class AIEngine:
 
         # Use preset base_url if user hasn't overridden
         if not base_url and preset:
-            base_url = preset.get("base_url", "")
+            base_url = str(preset.get("base_url", ""))
 
         kwargs: Dict[str, Any] = {"api_key": api_key or "unused"}
 
@@ -458,24 +457,32 @@ class AIEngine:
     def client(self) -> OpenAI:
         if self._client is None:
             self._setup_client()
+        assert self._client is not None
         return self._client
 
     def chat(
         self,
-        conversation: Conversation,
+        conversation: Optional[Conversation] = None,
         stream: bool = True,
         on_token: Optional[Callable[[str], None]] = None,
+        messages: Optional[List[Dict[str, str]]] = None,
+        **kwargs: Any,
     ) -> str:
         """Send conversation to LLM and return response."""
-        messages = conversation.to_api_messages()
+        if conversation is not None:
+            api_messages = conversation.to_api_messages()
+        elif messages is not None:
+            api_messages = messages
+        else:
+            raise ValueError("Either conversation or messages must be provided")
 
         if stream and on_token:
-            return self._stream_chat(messages, on_token)
+            return self._stream_chat(api_messages, on_token)
         else:
-            return self._blocking_chat(messages)
+            return self._blocking_chat(api_messages)
 
-    def _blocking_chat(self, messages: List[Dict[str, str]]) -> str:
-        response = self.client.chat.completions.create(
+    def _blocking_chat(self, messages: Any) -> str:
+        response: Any = self.client.chat.completions.create(
             model=self.config.model,
             messages=messages,
             temperature=self.config.temperature,
@@ -485,10 +492,10 @@ class AIEngine:
 
     def _stream_chat(
         self,
-        messages: List[Dict[str, str]],
+        messages: Any,
         on_token: Callable[[str], None],
     ) -> str:
-        stream = self.client.chat.completions.create(
+        stream: Any = self.client.chat.completions.create(
             model=self.config.model,
             messages=messages,
             temperature=self.config.temperature,
@@ -497,7 +504,7 @@ class AIEngine:
         )
         full_response = []
         for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content:
+            if getattr(chunk, "choices", None) and chunk.choices[0].delta.content:
                 token = chunk.choices[0].delta.content
                 full_response.append(token)
                 on_token(token)

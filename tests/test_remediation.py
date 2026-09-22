@@ -940,6 +940,43 @@ class TestEdgeCases:
         r = engine.remediate_finding(FINDING_UNKNOWN, use_ai=True)
         assert r.source == "generic"
 
+    def test_ai_remediate_success(self):
+        """When AI engine is provided and returns structured text, it should parse correctly."""
+        from hackbot.core.engine import AIEngine, Conversation
+        ai_engine = MagicMock(spec=AIEngine)
+        ai_engine.chat.return_value = """SUMMARY: Fix for custom vulnerability
+COMMAND:
+<title>: Update configuration
+<description>: Secure the app configuration
+<language>: bash
+```
+secure_mode = true
+```
+
+REFERENCES:
+- https://example.com/fix
+"""
+        engine = RemediationEngine(ai_engine=ai_engine)
+        r = engine.remediate_finding(FINDING_UNKNOWN, use_ai=True)
+        assert r.source == "ai"
+        assert r.summary == "Fix for custom vulnerability"
+        assert len(r.steps) == 1
+        assert r.steps[0].content == "secure_mode = true"
+        assert "https://example.com/fix" in r.references
+        ai_engine.chat.assert_called_once()
+        call_args, call_kwargs = ai_engine.chat.call_args
+        assert isinstance(call_args[0], Conversation)
+        assert call_kwargs.get("stream") is False
+
+    def test_ai_remediate_exception_fallback(self):
+        """When AI engine raises an exception, should gracefully fall back to generic."""
+        from hackbot.core.engine import AIEngine
+        ai_engine = MagicMock(spec=AIEngine)
+        ai_engine.chat.side_effect = RuntimeError("API error")
+        engine = RemediationEngine(ai_engine=ai_engine)
+        r = engine.remediate_finding(FINDING_UNKNOWN, use_ai=True)
+        assert r.source == "generic"
+
     def test_concurrent_usage(self):
         """Engine should be safe for concurrent use."""
         import threading

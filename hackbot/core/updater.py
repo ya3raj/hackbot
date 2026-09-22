@@ -7,8 +7,6 @@ Check for new releases on GitHub and self-update via pip.
 from __future__ import annotations
 
 import json
-import platform
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass

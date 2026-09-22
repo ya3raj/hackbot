@@ -44,7 +44,7 @@ except ImportError:
 try:
     from hackbot.core.plugins import get_plugin_manager
 except ImportError:
-    get_plugin_manager = None
+    get_plugin_manager = None  # type: ignore[assignment]
 
 
 class Severity(str, Enum):
@@ -552,7 +552,7 @@ Explain your reasoning at each step."""
             return "No findings recorded yet."
 
         lines = ["# Security Findings\n"]
-        by_severity = {}
+        by_severity: Dict[str, List[Finding]] = {}
         for f in self.findings:
             sev = f.severity.value
             by_severity.setdefault(sev, []).append(f)
@@ -595,6 +595,9 @@ Explain your reasoning at each step."""
 
         Returns the last AI analysis text, or "" if nothing was executed.
         """
+        if not self.conversation:
+            return ""
+
         last_analysis = ""
         failure_counts: Dict[tuple[str, int, str], int] = {}
 
@@ -1118,7 +1121,6 @@ Explain your reasoning at each step."""
         ]
 
         interesting_count = 0
-        anomaly_count = 0
         for i, payload in enumerate(payloads[:20]):  # Cap at 20 for performance
             # Use curl to send the payload
             safe_payload = payload.replace("'", "'\\''")
@@ -1128,7 +1130,7 @@ Explain your reasoning at each step."""
                 cmd = f"curl -sk -o /dev/null -w '%{{http_code}} %{{time_total}} %{{size_download}}' -d '{safe_payload}' '{target_url}'"
 
             result = self.runner.execute(
-                cmd, tool_name="curl", explanation=f"Fuzz payload {i+1}/{len(payloads)}"
+                cmd, tool_name="curl", explanation=f"Fuzz payload {i+1}/{len(payloads)} ({explanation})"
             )
 
             if result.success and result.stdout.strip():

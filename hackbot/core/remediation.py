@@ -1348,7 +1348,9 @@ class RemediationEngine:
                 m = pattern.search(search_text)
                 if m:
                     try:
-                        return builder(finding, m)
+                        rem = builder(finding, m)
+                        if isinstance(rem, Remediation):
+                            return rem
                     except Exception as e:
                         logger.warning(f"Rule failed for '{title}': {e}")
 
@@ -1371,11 +1373,15 @@ class RemediationEngine:
 
     def _ai_remediate(self, finding: Dict[str, Any]) -> Remediation:
         """Use AI to generate tailored remediation."""
+        if not self.ai_engine:
+            return self._generic_remediation(finding)
         prompt = self._build_ai_prompt(finding)
         try:
+            from hackbot.core.engine import Conversation, Message
+            conv = Conversation(messages=[Message(role="user", content=prompt)])
             response = self.ai_engine.chat(
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
+                conv,
+                stream=False,
             )
             return self._parse_ai_response(finding, response)
         except Exception as e:
@@ -1448,14 +1454,14 @@ Include at least one COMMAND and one CODE or CONFIG section. Be specific to the 
                 current_type = section_stripped
                 continue
             if section_stripped == 'REFERENCES':
+                current_type = 'REFERENCES'
                 # Extract reference URLs
-                ref_matches = re.findall(r'-\s*(https?://\S+)', section if i + 1 < len(sections) else "")
-                if not ref_matches and i + 1 < len(sections):
+                if i + 1 < len(sections):
                     ref_matches = re.findall(r'-\s*(https?://\S+)', sections[i + 1])
-                references.extend(ref_matches)
+                    references.extend(ref_matches)
                 continue
 
-            if current_type and section_stripped:
+            if current_type in ('COMMAND', 'CONFIG', 'CODE') and section_stripped:
                 rtype = {
                     'COMMAND': RemediationType.COMMAND,
                     'CONFIG': RemediationType.CONFIG,

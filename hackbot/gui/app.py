@@ -12,7 +12,6 @@ import json
 import logging
 import os
 import queue
-import shutil
 import threading
 import time
 import webbrowser
@@ -22,7 +21,7 @@ from typing import Any, Dict, List, Optional
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
 from hackbot import __version__
-from hackbot.config import HackBotConfig, detect_platform, detect_tools, load_config, save_config
+from hackbot.config import HackBotConfig, detect_platform, detect_tools, save_config
 from hackbot.core.engine import AIEngine, PROVIDERS, SUPPORTED_LANGUAGES
 from hackbot.core.cve import CVELookup
 from hackbot.core.compliance import ComplianceMapper
@@ -30,13 +29,10 @@ from hackbot.core.osint import OSINTEngine
 from hackbot.core.topology import TopologyParser
 from hackbot.core.pdf_report import PDFReportGenerator, HAS_REPORTLAB
 from hackbot.core.diff_report import DiffEngine, list_agent_sessions, load_session_findings
-from hackbot.core.plugins import get_plugin_manager, reset_plugin_manager, ensure_plugins_dir, PLUGINS_DIR
-from hackbot.core.campaigns import (
-    Campaign, CampaignManager, CampaignStatus, TargetStatus,
-    get_campaign_manager, reset_campaign_manager,
-)
+from hackbot.core.plugins import get_plugin_manager, reset_plugin_manager, PLUGINS_DIR
+from hackbot.core.campaigns import get_campaign_manager
 from hackbot.core.remediation import RemediationEngine
-from hackbot.core.proxy import ProxyEngine, get_proxy_engine, reset_proxy_engine
+from hackbot.core.proxy import ProxyEngine, get_proxy_engine
 from hackbot.core.updater import check_for_updates, perform_update
 from hackbot.core.vulndb import VulnDB
 from hackbot.memory import MemoryManager

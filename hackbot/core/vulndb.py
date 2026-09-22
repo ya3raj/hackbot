@@ -38,7 +38,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from hackbot.config import DATA_DIR, ensure_dirs
 
@@ -306,7 +306,7 @@ class VulnDB:
                    VALUES (?, ?, ?, ?, ?)""",
                 (target, scope, time.time(), json.dumps(tools_used or []), notes),
             )
-            return cur.lastrowid
+            return int(cur.lastrowid or 0)
 
     def finish_assessment(
         self,
@@ -408,7 +408,7 @@ class VulnDB:
                         conn, existing["id"], existing["status"], "open",
                         "Re-opened: found again in new assessment",
                     )
-                return existing["id"]
+                return int(existing["id"])
 
             risk = SEVERITY_WEIGHTS.get(severity, 0.5)
             cve_ids = finding.get("cve_ids", [])
@@ -433,7 +433,7 @@ class VulnDB:
                     finding.get("timestamp", time.time()),
                 ),
             )
-            return cur.lastrowid
+            return int(cur.lastrowid or 0)
 
     def add_findings_bulk(
         self,
@@ -850,7 +850,7 @@ class VulnDB:
         with self._connect() as conn:
             conn.execute("DELETE FROM remediation_log WHERE finding_id = ?", (finding_id,))
             cur = conn.execute("DELETE FROM findings WHERE id = ?", (finding_id,))
-            return cur.rowcount > 0
+            return bool(cur.rowcount > 0)
 
     def delete_assessment(self, assessment_id: int) -> bool:
         """Delete an assessment and all its findings."""
@@ -862,7 +862,7 @@ class VulnDB:
                 conn.execute("DELETE FROM remediation_log WHERE finding_id = ?", (row["id"],))
             conn.execute("DELETE FROM findings WHERE assessment_id = ?", (assessment_id,))
             cur = conn.execute("DELETE FROM assessments WHERE id = ?", (assessment_id,))
-            return cur.rowcount > 0
+            return bool(cur.rowcount > 0)
 
     def purge_all(self) -> int:
         """Delete everything. Returns total rows deleted. USE WITH CAUTION."""
@@ -871,14 +871,14 @@ class VulnDB:
             c2 = conn.execute("DELETE FROM findings").rowcount
             c3 = conn.execute("DELETE FROM assessments").rowcount
             c4 = conn.execute("DELETE FROM risk_snapshots").rowcount
-            return c1 + c2 + c3 + c4
+            return int(c1 + c2 + c3 + c4)
 
     @property
     def db_size(self) -> str:
         """Human-readable database file size."""
         if not self.db_path.exists():
             return "0 B"
-        size = self.db_path.stat().st_size
+        size = float(self.db_path.stat().st_size)
         for unit in ("B", "KB", "MB", "GB"):
             if size < 1024:
                 return f"{size:.1f} {unit}"

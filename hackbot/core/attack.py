@@ -924,7 +924,7 @@ class AttackMapper:
     def get_tool_techniques(tool_name: str) -> List[Dict[str, Any]]:
         """Get ATT&CK techniques mapped to a specific tool."""
         mappings = TOOL_TECHNIQUE_MAP.get(tool_name.lower(), [])
-        result = []
+        result: List[Dict[str, Any]] = []
         for tech_id, confidence, notes in mappings:
             tech = TECHNIQUE_MAP.get(tech_id)
             if tech:

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from hackbot.config import HackBotConfig, SESSIONS_DIR
-from hackbot.core.engine import AIEngine, Conversation, create_conversation
+from hackbot.core.engine import AIEngine, create_conversation
 from hackbot.core.rag_memory import get_rag_memory, RAGMemory
 from hackbot.memory import ConversationSummarizer, MemoryManager, CONTINUE_PROMPT
 

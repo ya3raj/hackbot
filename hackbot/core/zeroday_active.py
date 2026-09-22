@@ -299,7 +299,7 @@ class HttpClient:
 
     @property
     def cookies(self) -> Dict[str, str]:
-        return dict(self.session.cookies)
+        return {str(k): str(v) for k, v in self.session.cookies.get_dict().items() if v is not None}
 
     @property
     def history(self) -> List[Dict[str, Any]]:

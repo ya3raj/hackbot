@@ -7,12 +7,11 @@ Supports keyword search, CVE-ID lookup, and automatic service→CVE mapping.
 
 from __future__ import annotations
 
-import json
+import math
 import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote_plus
 
 import requests
 
@@ -92,6 +91,194 @@ class ExploitEntry:
             "type": self.exploit_type,
             "date": self.date,
         }
+
+
+@dataclass
+class CVSSResult:
+    """Result of a CVSS v3.1 score calculation."""
+
+    vector: str
+    base_score: float
+    severity: str
+    impact_subscore: float
+    exploitability_subscore: float
+    metrics: Dict[str, str] = field(default_factory=dict)
+    descriptions: Dict[str, str] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "vector": self.vector,
+            "base_score": self.base_score,
+            "severity": self.severity,
+            "impact_subscore": self.impact_subscore,
+            "exploitability_subscore": self.exploitability_subscore,
+            "metrics": self.metrics,
+            "descriptions": self.descriptions,
+        }
+
+    def summary(self) -> str:
+        lines = [
+            f"**CVSS v3.1 Score:** {self.base_score} ({self.severity})",
+            f"**Vector:** `{self.vector}`",
+            f"**Impact Subscore:** {self.impact_subscore:.1f} | **Exploitability Subscore:** {self.exploitability_subscore:.1f}",
+            "",
+            "| Metric | Value | Description |",
+            "|--------|-------|-------------|",
+        ]
+        for metric, val in self.metrics.items():
+            desc = self.descriptions.get(metric, val)
+            lines.append(f"| {metric} | {val} | {desc} |")
+        return "\n".join(lines)
+
+
+class CVSSCalculator:
+    """FIRST CVSS v3.1 Vector Parser and Base Score Calculator."""
+
+    METRIC_NAMES: Dict[str, str] = {
+        "AV": "Attack Vector",
+        "AC": "Attack Complexity",
+        "PR": "Privileges Required",
+        "UI": "User Interaction",
+        "S": "Scope",
+        "C": "Confidentiality Impact",
+        "I": "Integrity Impact",
+        "A": "Availability Impact",
+    }
+
+    METRIC_VALUES: Dict[str, Dict[str, str]] = {
+        "AV": {"N": "Network", "A": "Adjacent", "L": "Local", "P": "Physical"},
+        "AC": {"L": "Low", "H": "High"},
+        "PR": {"N": "None", "L": "Low", "H": "High"},
+        "UI": {"N": "None", "R": "Required"},
+        "S": {"U": "Unchanged", "C": "Changed"},
+        "C": {"N": "None", "L": "Low", "H": "High"},
+        "I": {"N": "None", "L": "Low", "H": "High"},
+        "A": {"N": "None", "L": "Low", "H": "High"},
+    }
+
+    WEIGHTS: Dict[str, Dict[str, float]] = {
+        "AV": {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.20},
+        "AC": {"L": 0.77, "H": 0.44},
+        "PR_U": {"N": 0.85, "L": 0.62, "H": 0.27},
+        "PR_C": {"N": 0.85, "L": 0.68, "H": 0.50},
+        "UI": {"N": 0.85, "R": 0.62},
+        "C": {"N": 0.0, "L": 0.22, "H": 0.56},
+        "I": {"N": 0.0, "L": 0.22, "H": 0.56},
+        "A": {"N": 0.0, "L": 0.22, "H": 0.56},
+    }
+
+    @staticmethod
+    def roundup(input_val: float) -> float:
+        """CVSS v3.1 round-up function: smallest number to 1 decimal place >= input."""
+        int_input = round(input_val * 100000)
+        if int_input % 10000 == 0:
+            return int_input / 100000.0
+        return (math.floor(int_input / 10000) + 1) / 10.0
+
+    @classmethod
+    def parse_vector(cls, vector_str: str) -> Dict[str, str]:
+        """
+        Parse a CVSS v3.1 vector string into metric key-value pairs.
+        Example: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H'
+        """
+        cleaned = vector_str.strip()
+        if "/" in cleaned and (cleaned.upper().startswith("CVSS:3.1/") or cleaned.upper().startswith("CVSS:3.0/")):
+            parts = cleaned.split("/")[1:]
+        else:
+            parts = cleaned.split("/")
+
+        metrics: Dict[str, str] = {}
+        for part in parts:
+            if ":" in part:
+                k, v = part.split(":", 1)
+                metrics[k.strip().upper()] = v.strip().upper()
+        return metrics
+
+    @classmethod
+    def calculate(cls, vector_or_metrics: str | Dict[str, str]) -> CVSSResult:
+        """
+        Calculate the CVSS v3.1 base score from a vector string or metrics dict.
+        """
+        if isinstance(vector_or_metrics, str):
+            metrics = cls.parse_vector(vector_or_metrics)
+        else:
+            metrics = {k.upper(): v.upper() for k, v in vector_or_metrics.items()}
+
+        required = ["AV", "AC", "PR", "UI", "S", "C", "I", "A"]
+        missing = [m for m in required if m not in metrics]
+        if missing:
+            raise ValueError(f"Missing required CVSS v3.1 metrics: {', '.join(missing)}")
+
+        av = metrics["AV"]
+        ac = metrics["AC"]
+        pr = metrics["PR"]
+        ui = metrics["UI"]
+        scope = metrics["S"]
+        c = metrics["C"]
+        i = metrics["I"]
+        a = metrics["A"]
+
+        for m, val in [("AV", av), ("AC", ac), ("PR", pr), ("UI", ui), ("S", scope), ("C", c), ("I", i), ("A", a)]:
+            if val not in cls.METRIC_VALUES[m]:
+                raise ValueError(f"Invalid value '{val}' for CVSS metric {m}")
+
+        av_w = cls.WEIGHTS["AV"][av]
+        ac_w = cls.WEIGHTS["AC"][ac]
+        pr_w = cls.WEIGHTS["PR_C" if scope == "C" else "PR_U"][pr]
+        ui_w = cls.WEIGHTS["UI"][ui]
+
+        c_w = cls.WEIGHTS["C"][c]
+        i_w = cls.WEIGHTS["I"][i]
+        a_w = cls.WEIGHTS["A"][a]
+
+        iss = 1.0 - ((1.0 - c_w) * (1.0 - i_w) * (1.0 - a_w))
+
+        if scope == "U":
+            impact = 6.42 * iss
+        else:
+            impact = 7.52 * (iss - 0.029) - 3.25 * ((iss - 0.02) ** 15)
+
+        exploitability = 8.22 * av_w * ac_w * pr_w * ui_w
+
+        if impact <= 0:
+            base_score = 0.0
+        else:
+            if scope == "U":
+                base_score = min(10.0, cls.roundup(impact + exploitability))
+            else:
+                base_score = min(10.0, cls.roundup(1.08 * (impact + exploitability)))
+
+        if base_score == 0.0:
+            severity = "None"
+        elif base_score < 4.0:
+            severity = "Low"
+        elif base_score < 7.0:
+            severity = "Medium"
+        elif base_score < 9.0:
+            severity = "High"
+        else:
+            severity = "Critical"
+
+        descriptions: Dict[str, str] = {}
+        for m in required:
+            val = metrics[m]
+            name = cls.METRIC_NAMES.get(m, m)
+            val_desc = cls.METRIC_VALUES[m].get(val, val)
+            descriptions[m] = f"{name}: {val_desc}"
+
+        standard_vector = (
+            f"CVSS:3.1/AV:{av}/AC:{ac}/PR:{pr}/UI:{ui}/S:{scope}/C:{c}/I:{i}/A:{a}"
+        )
+
+        return CVSSResult(
+            vector=standard_vector,
+            base_score=base_score,
+            severity=severity,
+            impact_subscore=round(impact, 1),
+            exploitability_subscore=round(exploitability, 1),
+            metrics=metrics,
+            descriptions=descriptions,
+        )
 
 
 # ── CVE Lookup Engine ────────────────────────────────────────────────────────
@@ -374,14 +561,15 @@ class CVELookup:
 
         # GitHub search for PoC repositories
         try:
+            params: Dict[str, Any] = {
+                "q": f"{cve_id} exploit OR poc OR vulnerability",
+                "sort": "stars",
+                "order": "desc",
+                "per_page": 5,
+            }
             resp = self._session.get(
                 GITHUB_EXPLOIT_SEARCH,
-                params={
-                    "q": f"{cve_id} exploit OR poc OR vulnerability",
-                    "sort": "stars",
-                    "order": "desc",
-                    "per_page": 5,
-                },
+                params=params,
                 timeout=self.timeout,
             )
             if resp.ok:
@@ -413,14 +601,15 @@ class CVELookup:
         exploits: List[Dict[str, str]] = []
 
         try:
+            search_params: Dict[str, Any] = {
+                "q": f"{query} exploit OR poc OR vulnerability",
+                "sort": "stars",
+                "order": "desc",
+                "per_page": min(max_results, 20),
+            }
             resp = self._session.get(
                 GITHUB_EXPLOIT_SEARCH,
-                params={
-                    "q": f"{query} exploit OR poc OR vulnerability",
-                    "sort": "stars",
-                    "order": "desc",
-                    "per_page": min(max_results, 20),
-                },
+                params=search_params,
                 timeout=self.timeout,
             )
             if resp.ok:

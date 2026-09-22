@@ -12,7 +12,7 @@ import asyncio
 import io
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import Any, Dict, Optional, TYPE_CHECKING
 
 from hackbot import __version__
 from hackbot.config import detect_platform, detect_tools, save_config
@@ -23,10 +23,11 @@ from hackbot.core.osint import OSINTEngine
 from hackbot.core.vulndb import VulnDB
 from hackbot.core.attack import AttackMapper
 from hackbot.modes.agent import AgentMode
+from hackbot.modes.chat import ChatMode
+from hackbot.modes.plan import PlanMode
 from hackbot.reporting import ReportGenerator
 
 from hackbot.integrations.telegram_bot.utils import format_html, split_message
-from hackbot.integrations.telegram_bot.constants import SESSION_TTL
 
 if TYPE_CHECKING:
     from hackbot.integrations.telegram_bot.bot import HackBotTelegram
@@ -207,9 +208,14 @@ async def cmd_agent(bot: "HackBotTelegram", update: Update, context: ContextType
         parse_mode=ParseMode.HTML,
     )
 
+    agent = session.agent_mode
+    if not agent:
+        await update.message.reply_text("❌ Failed to initialize agent mode.")
+        return
+
     loop = asyncio.get_event_loop()
     try:
-        response = await loop.run_in_executor(None, lambda: session.agent_mode.start(target))
+        response = await loop.run_in_executor(None, lambda: agent.start(target))
         for chunk in split_message(response):
             await update.message.reply_text(format_html(chunk), parse_mode=ParseMode.HTML)
     except Exception as e:
@@ -218,7 +224,8 @@ async def cmd_agent(bot: "HackBotTelegram", update: Update, context: ContextType
 
 async def cmd_step(bot: "HackBotTelegram", update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     session = bot._get_session(update.effective_user.id)
-    if session.mode != "agent" or not session.agent_mode or not session.agent_mode.is_running:
+    agent = session.agent_mode
+    if session.mode != "agent" or not agent or not agent.is_running:
         await update.message.reply_text(
             "No active assessment. Start one with:\n<code>/agent &lt;target&gt;</code>",
             parse_mode=ParseMode.HTML,
@@ -229,7 +236,7 @@ async def cmd_step(bot: "HackBotTelegram", update: Update, context: ContextTypes
     await update.message.chat.send_action(ChatAction.TYPING)
     loop = asyncio.get_event_loop()
     try:
-        response, is_complete = await loop.run_in_executor(None, lambda: session.agent_mode.step(user_input))
+        response, is_complete = await loop.run_in_executor(None, lambda: agent.step(user_input))
         for chunk in split_message(response):
             await update.message.reply_text(format_html(chunk), parse_mode=ParseMode.HTML)
         if is_complete:
@@ -296,6 +303,9 @@ async def cmd_plan(bot: "HackBotTelegram", update: Update, context: ContextTypes
         return
 
     session.mode = "plan"
+    if not session.plan_mode:
+        session.plan_mode = PlanMode(engine=bot.engine, config=bot.config)
+    plan_mode = session.plan_mode
     parts = target.split()
     plan_target = parts[0]
     plan_type = parts[1] if len(parts) > 1 else "web_pentest"
@@ -304,7 +314,7 @@ async def cmd_plan(bot: "HackBotTelegram", update: Update, context: ContextTypes
     loop = asyncio.get_event_loop()
     try:
         response = await loop.run_in_executor(
-            None, lambda: session.plan_mode.create_plan(plan_target, plan_type)
+            None, lambda: plan_mode.create_plan(plan_target, plan_type)
         )
         for chunk in split_message(response):
             await update.message.reply_text(format_html(chunk), parse_mode=ParseMode.HTML)
@@ -394,15 +404,17 @@ async def cmd_attack(bot: "HackBotTelegram", update: Update, context: ContextTyp
     mapper = AttackMapper()
 
     if subcmd == "map":
-        if not session.agent_mode or not session.agent_mode.findings:
+        agent = session.agent_mode
+        if not agent or not agent.findings:
             await update.message.reply_text("No findings to map. Run an agent assessment first.")
             return
-        findings = [f.to_dict() for f in session.agent_mode.findings]
-        tool_history = [r.to_dict() for r in session.agent_mode.runner.history]
+        findings = [f.to_dict() for f in agent.findings]
+        tool_history = [r.to_dict() for r in agent.runner.history]
+        target_name = agent.target
         loop = asyncio.get_event_loop()
         try:
             report = await loop.run_in_executor(
-                None, lambda: mapper.map_findings(findings, target=session.agent_mode.target, tool_history=tool_history),
+                None, lambda: mapper.map_findings(findings, target=target_name, tool_history=tool_history),
             )
             text = mapper.format_summary(report)
             await update.message.reply_text(format_html(text), parse_mode=ParseMode.HTML)
@@ -410,15 +422,17 @@ async def cmd_attack(bot: "HackBotTelegram", update: Update, context: ContextTyp
             await update.message.reply_text(f"❌ ATT&CK mapping error: {e}")
 
     elif subcmd == "full":
-        if not session.agent_mode or not session.agent_mode.findings:
+        agent = session.agent_mode
+        if not agent or not agent.findings:
             await update.message.reply_text("No findings to map. Run an agent assessment first.")
             return
-        findings = [f.to_dict() for f in session.agent_mode.findings]
-        tool_history = [r.to_dict() for r in session.agent_mode.runner.history]
+        findings = [f.to_dict() for f in agent.findings]
+        tool_history = [r.to_dict() for r in agent.runner.history]
+        target_name = agent.target
         loop = asyncio.get_event_loop()
         try:
             report = await loop.run_in_executor(
-                None, lambda: mapper.map_findings(findings, target=session.agent_mode.target, tool_history=tool_history),
+                None, lambda: mapper.map_findings(findings, target=target_name, tool_history=tool_history),
             )
             text = mapper.format_report(report)
             for chunk in split_message(text):
@@ -429,8 +443,8 @@ async def cmd_attack(bot: "HackBotTelegram", update: Update, context: ContextTyp
     elif subcmd == "tactics":
         tactics = AttackMapper.list_tactics()
         lines = ["<b>MITRE ATT&CK Tactics</b>\n"]
-        for t in tactics:
-            lines.append(f"<code>{t['id']}</code> — {t['name']}")
+        for tac in tactics:
+            lines.append(f"<code>{tac['id']}</code> — {tac['name']}")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     elif subcmd == "tool":
@@ -443,9 +457,9 @@ async def cmd_attack(bot: "HackBotTelegram", update: Update, context: ContextTyp
             await update.message.reply_text(f"No ATT&CK mappings for tool: {tool_name}")
             return
         lines = [f"<b>ATT&CK Techniques: {format_html(tool_name)}</b>\n"]
-        for t in techs:
-            tech = t["technique"]
-            lines.append(f"<code>{tech['id']}</code> {tech['name']} ({t['confidence']})")
+        for item in techs:
+            tech_dict: Dict[str, Any] = dict(item["technique"])
+            lines.append(f"<code>{tech_dict['id']}</code> {tech_dict['name']} ({item['confidence']})")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     elif subcmd == "lookup":
@@ -453,14 +467,14 @@ async def cmd_attack(bot: "HackBotTelegram", update: Update, context: ContextTyp
         if not tech_id:
             await update.message.reply_text("Usage: /attack lookup <technique_id>")
             return
-        tech = AttackMapper.get_technique(tech_id)
-        if not tech:
+        tech_info: Optional[Dict[str, Any]] = AttackMapper.get_technique(tech_id)
+        if not tech_info:
             await update.message.reply_text(f"Technique not found: {tech_id}")
             return
         await update.message.reply_text(
-            f"<b>{tech['id']}</b> — {tech['name']}\n"
-            f"Tactics: {', '.join(tech['tactic_ids'])}\n"
-            f"URL: {tech['url']}",
+            f"<b>{tech_info['id']}</b> — {tech_info['name']}\n"
+            f"Tactics: {', '.join(tech_info['tactic_ids'])}\n"
+            f"URL: {tech_info['url']}",
             parse_mode=ParseMode.HTML,
         )
 
@@ -877,28 +891,34 @@ async def message_handler(bot: "HackBotTelegram", update: Update, context: Conte
     loop = asyncio.get_event_loop()
 
     try:
+        chat_mode = session.chat_mode or ChatMode(engine=bot.engine, config=bot.config)
+        session.chat_mode = chat_mode
+        plan_mode = session.plan_mode or PlanMode(engine=bot.engine, config=bot.config)
+        session.plan_mode = plan_mode
+        agent_mode = session.agent_mode
+
         if session.mode == "chat":
             response = await loop.run_in_executor(
-                None, lambda: session.chat_mode.ask(text, stream=False)
+                None, lambda: chat_mode.ask(text, stream=False)
             )
         elif session.mode == "agent":
-            if session.agent_mode and session.agent_mode.is_running:
+            if agent_mode and agent_mode.is_running:
                 response, is_complete = await loop.run_in_executor(
-                    None, lambda: session.agent_mode.step(text)
+                    None, lambda: agent_mode.step(text)
                 )
                 if is_complete:
                     response += "\n\n✅ Assessment complete!"
             else:
                 response = await loop.run_in_executor(
-                    None, lambda: session.chat_mode.ask(text, stream=False)
+                    None, lambda: chat_mode.ask(text, stream=False)
                 )
         elif session.mode == "plan":
             response = await loop.run_in_executor(
-                None, lambda: session.plan_mode.ask(text, stream=False)
+                None, lambda: plan_mode.ask(text, stream=False)
             )
         else:
             response = await loop.run_in_executor(
-                None, lambda: session.chat_mode.ask(text, stream=False)
+                None, lambda: chat_mode.ask(text, stream=False)
             )
 
         for chunk in split_message(response):

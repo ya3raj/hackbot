@@ -254,3 +254,42 @@ def test_install_action_safe_mode_decline(monkeypatch, tmp_path):
     msg = a._process_install_action({"action": "install", "tool": "nuclei"})
     assert "declined" in msg.lower()
     assert called["installed"] is False
+
+
+def test_plan_mode_ask_stream_false():
+    """Verify PlanMode.ask accepts stream=False and stream=True without TypeError."""
+    engine = MagicMock(spec=AIEngine)
+    engine.chat.return_value = "Plan test response"
+    plan = PlanMode(engine=engine, config=HackBotConfig())
+
+    # Test with stream=False (used by telegram bot handler)
+    res = plan.ask("How to test SQLi?", stream=False)
+    assert res == "Plan test response"
+
+    # Test with stream=True
+    res_stream = plan.ask("Next phase", stream=True)
+    assert res_stream == "Plan test response"
+
+
+def test_zeroday_active_cookies():
+    """Verify HttpClient cookies property returns string dictionary."""
+    from hackbot.core.zeroday_active import HttpClient
+    client = HttpClient()
+    client.session.cookies.set("session_id", "abc123xyz")
+    assert client.cookies == {"session_id": "abc123xyz"}
+    assert isinstance(client.cookies, dict)
+
+
+def test_engine_chat_with_messages_list():
+    """Verify AIEngine.chat accepts messages list directly as well as Conversation."""
+    from hackbot.core.engine import AIEngine
+    from hackbot.config import HackBotConfig
+    engine = AIEngine(HackBotConfig().ai)
+    engine._client = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.choices = [MagicMock()]
+    mock_resp.choices[0].message.content = "Chat reply"
+    engine._client.chat.completions.create.return_value = mock_resp
+
+    reply = engine.chat(messages=[{"role": "user", "content": "hello"}], stream=False)
+    assert reply == "Chat reply"

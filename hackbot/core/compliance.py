@@ -81,8 +81,8 @@ class ComplianceReport:
         summary: Dict[str, Dict[str, int]] = {}
         for fw, maps in by_framework.items():
             counts = {"fail": 0, "warn": 0, "pass": 0, "not_tested": 0}
-            for m in maps:
-                counts[m["status"]] = counts.get(m["status"], 0) + 1
+            for item in maps:
+                counts[item["status"]] = counts.get(item["status"], 0) + 1
             summary[fw] = counts
 
         return {
@@ -445,7 +445,7 @@ class ComplianceMapper:
         return list(_FRAMEWORK_MAP.get(key, {}).values())
 
     @staticmethod
-    def list_frameworks() -> List[Dict[str, str]]:
+    def list_frameworks() -> List[Dict[str, Any]]:
         """List available frameworks."""
         return [
             {"key": "pci",   "name": Framework.PCI_DSS.value,     "controls": len(PCI_DSS_CONTROLS)},

@@ -58,3 +58,24 @@ def test_install_tool_delegates_to_agent(monkeypatch):
     result = app._install_tool("nuclei")
     assert result is True
     assert captured["action"] == {"action": "install", "tool": "nuclei"}
+
+
+def test_handle_cvss_valid_vector():
+    app = HackBotApp(HackBotConfig())
+    assert app._handle_cvss("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H") is True
+
+
+def test_handle_cvss_empty_prints_usage():
+    app = HackBotApp(HackBotConfig())
+    assert app._handle_cvss("") is True
+
+
+def test_show_topology_mermaid():
+    app = HackBotApp(HackBotConfig())
+    scan_output = """
+Nmap scan report for 192.168.1.1
+Host is up (0.001s latency).
+PORT   STATE SERVICE
+80/tcp open  http
+"""
+    assert app._show_topology(f"mermaid {scan_output}") is True

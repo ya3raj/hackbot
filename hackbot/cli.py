@@ -8,17 +8,16 @@ and comprehensive command handling.
 from __future__ import annotations
 
 import os
-import sys
+import re
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import click
 from dotenv import load_dotenv
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.history import FileHistory
-from rich.live import Live
 from rich.markdown import Markdown
 
 from hackbot import __version__
@@ -32,18 +31,18 @@ from hackbot.config import (
 )
 from hackbot.core.engine import AIEngine, PROVIDERS
 from hackbot.core.engine import SUPPORTED_LANGUAGES
-from hackbot.core.cve import CVELookup
+from hackbot.core.cve import CVELookup, CVSSCalculator
 from hackbot.core.compliance import ComplianceMapper
 from hackbot.core.osint import OSINTEngine
 from hackbot.core.diff_report import DiffEngine, list_agent_sessions, load_session_findings
 from hackbot.core.pdf_report import PDFReportGenerator, HAS_REPORTLAB
-from hackbot.core.plugins import PluginManager, get_plugin_manager, ensure_plugins_dir, PLUGINS_DIR
+from hackbot.core.plugins import get_plugin_manager, ensure_plugins_dir, PLUGINS_DIR
 from hackbot.core.campaigns import (
-    Campaign, CampaignManager, CampaignStatus, TargetStatus,
-    get_campaign_manager, reset_campaign_manager,
+    Campaign, CampaignStatus, TargetStatus,
+    get_campaign_manager,
 )
 from hackbot.core.remediation import RemediationEngine
-from hackbot.core.proxy import ProxyEngine, get_proxy_engine, reset_proxy_engine
+from hackbot.core.proxy import ProxyEngine, get_proxy_engine
 from hackbot.core.topology import TopologyParser
 from hackbot.core.updater import check_for_updates, perform_update
 from hackbot.core.vulndb import VulnDB
@@ -59,7 +58,6 @@ from hackbot.ui import (
     print_error,
     print_finding,
     print_info,
-    print_step,
     print_success,
     print_tool_execution,
     print_tool_result,
@@ -120,6 +118,7 @@ class HackBotApp:
             report_format=config.reporting.format,
         )
         self._start_time = time.time()
+        self._active_campaign_target: Optional[str] = None
 
     # ── Token streaming callback ─────────────────────────────────────────
 
@@ -178,14 +177,18 @@ class HackBotApp:
         cmd = parts[0].lower()
         args = parts[1] if len(parts) > 1 else ""
 
+        def _call_and_continue(fn) -> bool:
+            fn()
+            return True
+
         commands = {
             "/quit": lambda: False,
             "/exit": lambda: False,
             "/q": lambda: False,
-            "/help": lambda: (show_help(), True)[1],
-            "/version": lambda: (self._show_version(), True)[1],
-            "/donate": lambda: (self._show_donate(), True)[1],
-            "/manual": lambda: (self._show_manual(), True)[1],
+            "/help": lambda: _call_and_continue(show_help),
+            "/version": lambda: _call_and_continue(self._show_version),
+            "/donate": lambda: _call_and_continue(self._show_donate),
+            "/manual": lambda: _call_and_continue(self._show_manual),
             "/chat": lambda: self._switch_mode("chat"),
             "/agent": lambda: self._start_agent(args),
             "/plan": lambda: self._switch_mode("plan"),
@@ -213,6 +216,7 @@ class HackBotApp:
             "/checklist": lambda: self._generate_checklist(args),
             "/commands": lambda: self._generate_commands(args),
             "/cve": lambda: self._cve_lookup(args),
+            "/cvss": lambda: self._handle_cvss(args),
             "/osint": lambda: self._osint_scan(args),
             "/topology": lambda: self._show_topology(args),
             "/compliance": lambda: self._compliance_map(args),
@@ -656,11 +660,9 @@ class HackBotApp:
         """Handle /telegram commands: start, stop, status, qr."""
         try:
             from hackbot.integrations.telegram_bot import (
-                HackBotTelegram,
                 check_telegram_deps,
                 get_telegram_bot,
                 reset_telegram_bot,
-                generate_qr_terminal,
             )
         except ImportError:
             print_error(
@@ -1142,9 +1144,9 @@ class HackBotApp:
                 print_error("Usage: /proxy replay <request_id>")
             else:
                 req_id = int(sub_args)
-                result = proxy.replay_request(req_id)
-                if result:
-                    md = ProxyEngine.get_request_detail_markdown(result)
+                replayed = proxy.replay_request(req_id)
+                if replayed:
+                    md = ProxyEngine.get_request_detail_markdown(replayed)
                     console.print(Markdown(md))
                 else:
                     print_error(f"Request #{req_id} not found")
@@ -1635,6 +1637,37 @@ class HackBotApp:
 
         return True
 
+    def _handle_cvss(self, args: str) -> bool:
+        """Parse CVSS v3.1 vector and calculate base score."""
+        vector = args.strip()
+        if not vector:
+            print_error(
+                "Usage:\n"
+                "  /cvss <vector>\n"
+                "  Example: /cvss CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H\n"
+                "  Example: /cvss AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:N"
+            )
+            return True
+
+        try:
+            res = CVSSCalculator.calculate(vector)
+            sev_colors = {
+                "Critical": "bold red",
+                "High": "bold yellow",
+                "Medium": "bold yellow",
+                "Low": "bold cyan",
+                "None": "dim",
+            }
+            color = sev_colors.get(res.severity, "white")
+            console.print(f"\n[{color}]⚡ CVSS v3.1 Base Score: {res.base_score} ({res.severity})[/]")
+            console.print(f"[dim]Vector: {res.vector}[/]")
+            console.print(f"Impact Subscore: [bold]{res.impact_subscore}[/] | Exploitability: [bold]{res.exploitability_subscore}[/]\n")
+            console.print(Markdown(res.summary()))
+        except Exception as e:
+            print_error(f"Invalid CVSS vector: {str(e)}")
+
+        return True
+
     def _osint_scan(self, args: str) -> bool:
         """Run OSINT scan on a domain."""
         if not args:
@@ -1733,29 +1766,41 @@ class HackBotApp:
 
     def _show_topology(self, args: str) -> bool:
         """Display network topology from scan results."""
-        if not args and self.agent and self.agent.runner.history:
+        mermaid_only = False
+        raw_args = args.strip()
+        if raw_args.startswith("mermaid") or raw_args.startswith("--mermaid"):
+            mermaid_only = True
+            raw_args = re.sub(r"^(--mermaid|mermaid)\s*", "", raw_args).strip()
+
+        scan_text = raw_args
+        if not scan_text and self.agent and self.agent.runner.history:
             # Try to use the last nmap scan from agent history
             for result in reversed(self.agent.runner.history):
                 if "nmap" in result.command.lower() or "masscan" in result.command.lower():
-                    args = result.stdout
+                    scan_text = result.stdout
                     break
 
-        if not args:
+        if not scan_text:
             print_error(
                 "Usage:\n"
                 "  /topology <paste nmap/masscan output>\n"
-                "  /topology   (auto-detect from last agent scan)"
+                "  /topology mermaid [scan output]  (render Mermaid graph syntax)\n"
+                "  /topology                        (auto-detect from last agent scan)"
             )
             return True
 
         parser = TopologyParser()
-        topo = parser.auto_parse(args)
+        topo = parser.auto_parse(scan_text)
+
+        if mermaid_only:
+            console.print(topo.to_mermaid())
+            return True
 
         # Show ASCII topology
         ascii_map = TopologyParser.render_ascii(topo)
         console.print(ascii_map)
 
-        # Also show markdown summary
+        # Also show markdown summary (includes Mermaid graph)
         md = TopologyParser.format_markdown(topo)
         console.print(Markdown(md))
 
@@ -1811,6 +1856,7 @@ class HackBotApp:
             return True
 
         # Load new session
+        new_data: Optional[Dict[str, Any]] = None
         if new_id == "__current__":
             if not self.agent or not self.agent.findings:
                 print_error("No active agent with findings.")
@@ -1929,8 +1975,8 @@ class HackBotApp:
             table.add_column("ID", style="cyan", width=8)
             table.add_column("Name", style="bold")
             table.add_column("Description", style="dim")
-            for t in tactics:
-                table.add_row(t["id"], t["name"], t["description"][:60])
+            for tac in tactics:
+                table.add_row(tac["id"], tac["name"], tac["description"][:60])
             console.print(table)
             return True
 
@@ -1948,8 +1994,8 @@ class HackBotApp:
             table.add_column("ID", style="cyan", width=10)
             table.add_column("Name", style="bold")
             table.add_column("Tactics", style="dim")
-            for t in techs[:100]:
-                table.add_row(t["id"], t["name"], ", ".join(t["tactic_ids"]))
+            for tech_entry in techs[:100]:
+                table.add_row(tech_entry["id"], tech_entry["name"], ", ".join(tech_entry["tactic_ids"]))
             if len(techs) > 100:
                 print_info(f"(showing 100 of {len(techs)} techniques)")
             console.print(table)
@@ -1972,9 +2018,9 @@ class HackBotApp:
             table.add_column("Name", style="bold")
             table.add_column("Confidence", style="yellow")
             table.add_column("Notes", style="dim")
-            for t in techs:
-                tech = t["technique"]
-                table.add_row(tech["id"], tech["name"], t["confidence"], t["notes"])
+            for tool_tech in techs:
+                tech_item: Dict[str, Any] = dict(tool_tech["technique"])
+                table.add_row(tech_item["id"], tech_item["name"], tool_tech["confidence"], tool_tech["notes"])
             console.print(table)
             return True
 
@@ -1984,15 +2030,15 @@ class HackBotApp:
             if not tech_id:
                 print_error("Usage: /attack lookup <technique_id>")
                 return True
-            tech = AttackMapper.get_technique(tech_id)
-            if not tech:
+            tech_info: Optional[Dict[str, Any]] = AttackMapper.get_technique(tech_id)
+            if not tech_info:
                 print_info(f"Technique not found: {tech_id}")
                 return True
-            console.print(f"\n[bold cyan]{tech['id']}[/] — {tech['name']}")
-            console.print(f"  [dim]Tactics:[/] {', '.join(tech['tactic_ids'])}")
-            console.print(f"  [dim]URL:[/] {tech['url']}")
-            if tech["description"]:
-                console.print(f"  [dim]{tech['description']}[/]")
+            console.print(f"\n[bold cyan]{tech_info['id']}[/] — {tech_info['name']}")
+            console.print(f"  [dim]Tactics:[/] {', '.join(tech_info['tactic_ids'])}")
+            console.print(f"  [dim]URL:[/] {tech_info['url']}")
+            if tech_info["description"]:
+                console.print(f"  [dim]{tech_info['description']}[/]")
             console.print()
             return True
 
@@ -2732,7 +2778,6 @@ def telegram(ctx, token):
         from hackbot.integrations.telegram_bot import (
             HackBotTelegram,
             check_telegram_deps,
-            generate_qr_terminal,
         )
     except ImportError:
         print_error(
@@ -2944,6 +2989,7 @@ def _interactive_repl(config: HackBotConfig, show_banner_flag: bool = True) -> N
 def _mode_repl(app: HackBotApp, mode: str) -> None:
     """REPL for a specific mode."""
     history_file = CONFIG_DIR / "history"
+    session: PromptSession[str]
     try:
         session = PromptSession(
             history=FileHistory(str(history_file)),

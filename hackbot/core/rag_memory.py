@@ -475,7 +475,7 @@ class RAGMemory:
                     name=self._collection_name,
                     metadata={"hnsw:space": "cosine"},
                 )
-                return count
+                return int(count)
         except Exception as exc:
             logger.warning("RAG clear failed: %s", exc)
             return 0

@@ -15,12 +15,10 @@ Developed by Yashab Alam
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import re
-import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +119,7 @@ class FuzzResult:
 
 # ── Anomaly Detection Patterns ──────────────────────────────────────────────
 
-ANOMALY_PATTERNS = {
+ANOMALY_PATTERNS: Dict[str, Dict[str, Any]] = {
     "stack_trace": {
         "severity": "High",
         "confidence": 0.9,
@@ -203,6 +201,35 @@ ANOMALY_PATTERNS = {
             (r"(?:root:[x*]:0:0:|daemon:[x*]:)", "/etc/passwd content leaked"),
             (r"(?:\[global\]|smb\.conf|\.htaccess|web\.config).*=", "Config file content leaked"),
             (r"(?:<!\[CDATA\[|<!ENTITY|SYSTEM\s+\"file://)", "XXE injection signal"),
+        ],
+    },
+    "template_injection": {
+        "severity": "High",
+        "confidence": 0.85,
+        "patterns": [
+            (r"(?:TemplateSyntaxError|jinja2\.exceptions|Twig_Error|freemarker\.template|SmartyCompilerException)", "SSTI error disclosure"),
+            (r"(?:org\.thymeleaf\.exceptions|VelocityException)", "Java template engine error"),
+            (r"(?:django\.template\.exceptions|TemplateDoesNotExist)", "Django template engine error"),
+            (r"\b49\b.*(?:7\*7|\{\{)", "Template expression evaluation reflected"),
+        ],
+    },
+    "ssrf_cloud_metadata": {
+        "severity": "Critical",
+        "confidence": 0.9,
+        "patterns": [
+            (r"(?:ami-[a-z0-9]+|instance-id|security-credentials/|iam/security-credentials)", "AWS EC2 metadata disclosure"),
+            (r"(?:computeMetadata/v1|metadata-flavor:\s*Google)", "GCP metadata disclosure"),
+            (r"(?:169\.254\.169\.254|metadata\.google\.internal)", "Cloud metadata IP/host disclosure"),
+            (r"(?:identity/oauth2/token|metadata/instance\?api-version)", "Azure instance metadata disclosure"),
+        ],
+    },
+    "prototype_pollution": {
+        "severity": "High",
+        "confidence": 0.8,
+        "patterns": [
+            (r"(?:__proto__|constructor\.prototype)\s*(?:=|:)", "Prototype pollution vulnerability signal"),
+            (r"Cannot assign to read only property.*prototype", "JavaScript prototype manipulation error"),
+            (r"Object\.prototype pollution", "Prototype pollution reflection"),
         ],
     },
 }
@@ -328,7 +355,7 @@ class ZeroDayEngine:
     and active scanning with HTTP client integration.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._anomaly_cache: Dict[str, List[AnomalySignal]] = {}
         self._active_engine: Optional[Any] = None
 
@@ -539,6 +566,9 @@ class ZeroDayEngine:
             "memory_address": "Memory address leaks defeat ASLR. Combined with a memory corruption bug, this enables reliable exploitation.",
             "auth_leak": "Leaked credentials/keys provide direct access. Test extracted credentials against all discovered services and APIs.",
             "injection_signal": "Confirmed injection point. Escalate with targeted payloads: extract data, execute commands, or pivot to internal services.",
+            "template_injection": "Server-Side Template Injection (SSTI) allows execution of template syntax in backend engines, often escalating to remote code execution (RCE).",
+            "ssrf_cloud_metadata": "Disclosed cloud instance metadata allows exfiltration of IAM credentials, STS temporary tokens, or service account secrets, enabling cloud environment compromise.",
+            "prototype_pollution": "Prototype pollution enables tampering with JavaScript Object prototypes, potentially leading to property injection, authorization bypass, or remote code execution.",
         }
         return potentials.get(category, f"Anomaly detected ({indicator}). Investigate for exploitable condition.")
 

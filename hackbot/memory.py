@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from hackbot.config import SESSIONS_DIR
 
@@ -134,8 +134,11 @@ class MemoryManager:
         try:
             with open(path) as f:
                 data = json.load(f)
-            self._current_session_id = data.get("id", session_id)
-            return data
+            if not isinstance(data, dict):
+                return None
+            self._current_session_id = str(data.get("id", session_id))
+            res: Dict[str, Any] = dict(data)
+            return res
         except (json.JSONDecodeError, IOError):
             return None
 
@@ -404,7 +407,7 @@ class ConversationSummarizer:
         # Re-add recent messages
         conversation.messages.extend(recent_messages)
 
-        return summary
+        return str(summary)
 
     def get_continue_prompt(self) -> str:
         """Get the prompt to send when user wants to continue a stopped response."""

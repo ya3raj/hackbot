@@ -27,11 +27,10 @@ from __future__ import annotations
 import json
 import logging
 import time
-import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from hackbot.config import DATA_DIR
 
@@ -405,7 +404,7 @@ class Campaign:
         ]
 
         # Share findings from previously assessed targets
-        prev_findings = []
+        prev_findings: List[str] = []
         for t in self.targets:
             if t == current_target:
                 break

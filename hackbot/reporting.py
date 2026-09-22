@@ -1,18 +1,20 @@
 """
 HackBot Report Generator
 =========================
-Generates comprehensive security assessment reports in HTML, Markdown, and JSON formats.
+Generates comprehensive security assessment reports in HTML, Markdown, JSON, SARIF, and CSV formats.
 """
 
 from __future__ import annotations
 
+import csv
 import json
+import re
 import time
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from jinja2 import Template
 
+from hackbot import __version__
 from hackbot.config import REPORTS_DIR
 
 
@@ -122,6 +124,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <p>{{ summary }}</p>
 {% endif %}
 
+{% if posture %}
+<div style="background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 1.25rem; margin: 1.5rem 0; display: flex; align-items: center; justify-content: space-around; flex-wrap: wrap; gap: 1rem;">
+  <div style="text-align: center;">
+    <div style="font-size: 0.8rem; color: var(--text-dim); text-transform: uppercase;">Security Posture Score</div>
+    <div style="font-size: 2.2rem; font-weight: 800; color: {% if posture.score >= 80 %}var(--success){% elif posture.score >= 60 %}var(--medium){% else %}var(--critical){% endif %};">{{ posture.score }} / 100</div>
+    <div style="font-weight: 600;">Grade: {{ posture.grade }}</div>
+  </div>
+  <div style="text-align: center;">
+    <div style="font-size: 0.8rem; color: var(--text-dim); text-transform: uppercase;">Overall Risk Level</div>
+    <div style="font-size: 1.6rem; font-weight: 700; margin-top: 0.25rem;">{{ posture.risk_level }}</div>
+    <div style="font-size: 0.8rem; color: var(--text-dim);">Risk Index: {{ posture.risk_index }} / 10.0</div>
+  </div>
+  <div style="text-align: center;">
+    <div style="font-size: 0.8rem; color: var(--text-dim); text-transform: uppercase;">Remediation Effort</div>
+    <div style="font-size: 1.6rem; font-weight: 700; margin-top: 0.25rem;">~{{ posture.remediation_hours }} hrs</div>
+    <div style="font-size: 0.8rem; color: var(--text-dim);">Estimated engineering time</div>
+  </div>
+</div>
+{% endif %}
+
 <h2>2. Risk Assessment Charts</h2>
 {% if severity_counts %}
 <table style="width: 100%; border-collapse: collapse; margin: 1rem 0;">
@@ -223,8 +245,85 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </html>"""
 
 
+def calculate_security_posture(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Calculate an executive security posture score and risk metrics from findings.
+
+    Returns:
+        dict containing:
+            - score: int (0 to 100, where 100 is perfectly secure, 0 is heavily compromised)
+            - grade: str ("A+", "A", "B", "C", "D", "F")
+            - risk_level: str ("Low", "Medium", "High", "Critical")
+            - risk_index: float (aggregate weighted risk index from 0.0 to 10.0)
+            - remediation_hours: int (estimated effort in engineering hours)
+            - counts: Dict[str, int] (breakdown of findings by severity)
+    """
+    counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Info": 0}
+    for f in findings:
+        sev = str(f.get("severity", "Info")).strip().capitalize()
+        if sev not in counts:
+            sev = "Info"
+        counts[sev] += 1
+
+    total_deduction = (
+        counts["Critical"] * 25
+        + counts["High"] * 12
+        + counts["Medium"] * 5
+        + counts["Low"] * 1
+    )
+    score = max(0, 100 - total_deduction)
+
+    if score >= 97:
+        grade = "A+"
+    elif score >= 90:
+        grade = "A"
+    elif score >= 80:
+        grade = "B"
+    elif score >= 70:
+        grade = "C"
+    elif score >= 60:
+        grade = "D"
+    else:
+        grade = "F"
+
+    if counts["Critical"] > 0 or score < 50:
+        risk_level = "Critical"
+    elif counts["High"] > 0 or score < 70:
+        risk_level = "High"
+    elif counts["Medium"] > 0 or score < 85:
+        risk_level = "Medium"
+    else:
+        risk_level = "Low"
+
+    weighted_sum = (
+        counts["Critical"] * 10.0
+        + counts["High"] * 7.5
+        + counts["Medium"] * 4.0
+        + counts["Low"] * 1.5
+    )
+    risk_index = round(min(10.0, weighted_sum / max(1, len(findings))), 1) if findings else 0.0
+
+    remediation_hours = (
+        counts["Critical"] * 16
+        + counts["High"] * 8
+        + counts["Medium"] * 4
+        + counts["Low"] * 1
+    )
+
+    return {
+        "score": score,
+        "grade": grade,
+        "risk_level": risk_level,
+        "risk_index": risk_index,
+        "remediation_hours": remediation_hours,
+        "counts": counts,
+    }
+
+
 class ReportGenerator:
     """Generates security assessment reports."""
+
+    calculate_security_posture = staticmethod(calculate_security_posture)
 
     def __init__(self, include_raw: bool = True, report_format: str = "html"):
         self.include_raw = include_raw
@@ -234,19 +333,24 @@ class ReportGenerator:
         self,
         target: str,
         findings: List[Dict[str, Any]],
-        tool_history: List[Dict[str, Any]] = None,
-        scripts: List[Dict[str, Any]] = None,
+        tool_history: Optional[List[Dict[str, Any]]] = None,
+        scripts: Optional[List[Dict[str, Any]]] = None,
         scope: str = "",
         summary: str = "",
         start_time: float = 0,
     ) -> str:
         """Generate a report and return the file path."""
-        if self.report_format == "html":
+        fmt = (self.report_format or "html").lower()
+        if fmt == "html":
             return self._generate_html(target, findings, tool_history, scripts, scope, summary, start_time)
-        elif self.report_format == "markdown":
+        elif fmt == "markdown":
             return self._generate_markdown(target, findings, tool_history, scripts, scope, summary, start_time)
-        elif self.report_format == "json":
+        elif fmt == "json":
             return self._generate_json(target, findings, tool_history, scripts, scope, summary, start_time)
+        elif fmt in ("sarif", "sarif.json"):
+            return self._generate_sarif(target, findings, tool_history, scripts, scope, summary, start_time)
+        elif fmt == "csv":
+            return self._generate_csv(target, findings, tool_history, scripts, scope, summary, start_time)
         else:
             return self._generate_html(target, findings, tool_history, scripts, scope, summary, start_time)
 
@@ -257,7 +361,7 @@ class ReportGenerator:
         ts = time.strftime("%Y%m%d_%H%M%S")
         path = REPORTS_DIR / f"report_{target.replace('/', '_').replace(':', '_')}_{ts}.html"
 
-        severity_counts = {}
+        severity_counts: Dict[str, int] = {}
         for f in findings:
             sev = f.get("severity", "Info")
             severity_counts[sev] = severity_counts.get(sev, 0) + 1
@@ -270,6 +374,7 @@ class ReportGenerator:
         template = Template(HTML_TEMPLATE)
         normalized_tool_history = self._normalize_tool_history(tool_history)
         normalized_scripts = self._normalize_scripts(scripts)
+        posture = calculate_security_posture(findings)
         html = template.render(
             target=target,
             date=time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -282,6 +387,7 @@ class ReportGenerator:
             tool_history=normalized_tool_history,
             scripts=normalized_scripts,
             include_raw=self.include_raw,
+            posture=posture,
         )
 
         with open(path, "w", encoding="utf-8") as f:
@@ -297,12 +403,12 @@ class ReportGenerator:
         path = REPORTS_DIR / f"report_{target.replace('/', '_').replace(':', '_')}_{ts}.md"
 
         lines = [
-            f"# HackBot Security Report",
-            f"",
+            "# HackBot Security Report",
+            "",
             f"**Target:** {target}",
             f"**Date:** {time.strftime('%Y-%m-%d %H:%M:%S')}",
             f"**Scope:** {scope or 'Full Assessment'}",
-            f"",
+            "",
         ]
 
         lines.append("## 1. Executive Summary")
@@ -310,8 +416,16 @@ class ReportGenerator:
         if summary:
             lines.extend([summary, ""])
 
+        posture = calculate_security_posture(findings)
+        lines.extend([
+            f"**Security Posture Score:** {posture['score']} / 100 (Grade: {posture['grade']})  ",
+            f"**Risk Level:** {posture['risk_level']} (Risk Index: {posture['risk_index']}/10.0)  ",
+            f"**Remediation Effort Est.:** ~{posture['remediation_hours']} hours",
+            "",
+        ])
+
         # Risk Assessment Charts section
-        severity_counts = {}
+        severity_counts: Dict[str, int] = {}
         for finding in findings:
             sev = finding.get("severity", "Info")
             severity_counts[sev] = severity_counts.get(sev, 0) + 1
@@ -331,10 +445,10 @@ class ReportGenerator:
         for i, f in enumerate(findings, 1):
             sev = f.get("severity", "Info")
             lines.append(f"### {i}. [{sev}] {f.get('title', 'Untitled')}")
-            lines.append(f"")
+            lines.append("")
             lines.append(f"{f.get('description', '')}")
             if f.get("evidence"):
-                lines.extend(["", "**Evidence:**", f"```", f["evidence"], "```"])
+                lines.extend(["", "**Evidence:**", "```", f["evidence"], "```"])
             if f.get("recommendation"):
                 lines.extend(["", f"**Recommendation:** {f['recommendation']}"])
             lines.append("")
@@ -384,7 +498,7 @@ class ReportGenerator:
                     "",
                 ])
 
-        lines.extend(["", "---", f"*Generated by HackBot AI Cybersecurity Assistant*"])
+        lines.extend(["", "---", "*Generated by HackBot AI Cybersecurity Assistant*"])
 
         content = "\n".join(lines)
         with open(path, "w", encoding="utf-8") as f:
@@ -422,6 +536,7 @@ class ReportGenerator:
             "scope": scope,
             "summary": summary,
             "risk_assessment": risk_assessment,
+            "security_posture": calculate_security_posture(findings),
             "findings": findings,
             "tool_history": normalized_tool_history,
             "commands_executed": [
@@ -452,6 +567,152 @@ class ReportGenerator:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
         return str(path)
+
+    def _generate_sarif(
+        self,
+        target: str,
+        findings: List[Dict[str, Any]],
+        tool_history: Optional[List[Dict[str, Any]]] = None,
+        scripts: Optional[List[Dict[str, Any]]] = None,
+        scope: str = "",
+        summary: str = "",
+        start_time: float = 0,
+    ) -> str:
+        """Generate a SARIF 2.1.0 report for CI/CD and vulnerability tracking tools."""
+        REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        clean_target = target.replace("/", "_").replace(":", "_") or "target"
+        path = REPORTS_DIR / f"report_{clean_target}_{ts}.sarif"
+
+        rules: List[Dict[str, Any]] = []
+        results: List[Dict[str, Any]] = []
+        rule_map: Dict[str, int] = {}
+
+        severity_to_sarif_level = {
+            "critical": "error",
+            "high": "error",
+            "medium": "warning",
+            "low": "note",
+            "info": "none",
+        }
+        severity_to_score = {
+            "critical": "9.5",
+            "high": "8.0",
+            "medium": "5.5",
+            "low": "2.5",
+            "info": "0.0",
+        }
+
+        for idx, f in enumerate(findings):
+            title = str(f.get("title", f"Finding {idx + 1}") or f"Finding {idx + 1}").strip()
+            sev = str(f.get("severity", "Info")).strip().lower()
+            cvss = f.get("cvss") or severity_to_score.get(sev, "0.0")
+            desc = str(f.get("description", "") or title)
+            recom = str(f.get("recommendation", "") or "")
+            evidence = str(f.get("evidence", "") or "")
+            rule_id = str(f.get("id") or f.get("cve") or f"HB-{idx + 1:04d}")
+
+            if rule_id not in rule_map:
+                rule_idx = len(rules)
+                rule_map[rule_id] = rule_idx
+                rule_name = re.sub(r"[^A-Za-z0-9_]", "", title) or f"FindingRule_{idx + 1}"
+                rule_def: Dict[str, Any] = {
+                    "id": rule_id,
+                    "name": rule_name,
+                    "shortDescription": {"text": title},
+                    "fullDescription": {"text": desc},
+                    "defaultConfiguration": {
+                        "level": severity_to_sarif_level.get(sev, "warning"),
+                    },
+                    "properties": {
+                        "security-severity": str(cvss),
+                        "tags": ["security", sev],
+                    },
+                }
+                if recom:
+                    rule_def["help"] = {"text": f"Recommendation: {recom}"}
+                rules.append(rule_def)
+            else:
+                rule_idx = rule_map[rule_id]
+
+            message_text = f"{title}: {desc}"
+            if evidence:
+                message_text += f"\nEvidence: {evidence}"
+
+            res: Dict[str, Any] = {
+                "ruleId": rule_id,
+                "ruleIndex": rule_idx,
+                "level": severity_to_sarif_level.get(sev, "warning"),
+                "message": {"text": message_text},
+                "locations": [
+                    {
+                        "physicalLocation": {
+                            "artifactLocation": {
+                                "uri": target or "unknown-target",
+                            },
+                        }
+                    }
+                ],
+            }
+            results.append(res)
+
+        sarif_data = {
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [
+                {
+                    "tool": {
+                        "driver": {
+                            "name": "HackBot",
+                            "version": __version__,
+                            "informationUri": "https://github.com/yashab-cyber/hackbot",
+                            "rules": rules,
+                        }
+                    },
+                    "results": results,
+                }
+            ],
+        }
+
+        with open(path, "w", encoding="utf-8") as outfile:
+            json.dump(sarif_data, outfile, indent=2, ensure_ascii=False)
+
+        return str(path)
+
+    def _generate_csv(
+        self,
+        target: str,
+        findings: List[Dict[str, Any]],
+        tool_history: Optional[List[Dict[str, Any]]] = None,
+        scripts: Optional[List[Dict[str, Any]]] = None,
+        scope: str = "",
+        summary: str = "",
+        start_time: float = 0,
+    ) -> str:
+        """Generate a structured CSV report for spreadsheet analysis."""
+        REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        clean_target = target.replace("/", "_").replace(":", "_") or "target"
+        path = REPORTS_DIR / f"report_{clean_target}_{ts}.csv"
+
+        headers = ["Title", "Severity", "CVSS", "Tool", "Description", "Evidence", "Recommendation"]
+
+        with open(path, "w", newline="", encoding="utf-8") as outfile:
+            writer = csv.writer(outfile)
+            writer.writerow(headers)
+            for f_dict in findings:
+                writer.writerow([
+                    str(f_dict.get("title", "")),
+                    str(f_dict.get("severity", "Info")),
+                    str(f_dict.get("cvss", "")),
+                    str(f_dict.get("tool", "")),
+                    str(f_dict.get("description", "")),
+                    str(f_dict.get("evidence", "")),
+                    str(f_dict.get("recommendation", "")),
+                ])
+
+        return str(path)
+
 
     @staticmethod
     def _normalize_tool_history(tool_history: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:

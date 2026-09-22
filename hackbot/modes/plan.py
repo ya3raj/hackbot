@@ -7,13 +7,12 @@ security assessment methodologies.
 
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from hackbot.config import HackBotConfig, REPORTS_DIR, SESSIONS_DIR
-from hackbot.core.engine import AIEngine, Conversation, create_conversation
+from hackbot.config import HackBotConfig, REPORTS_DIR
+from hackbot.core.engine import AIEngine, create_conversation
 
 
 # ── Plan Templates ───────────────────────────────────────────────────────────
@@ -316,13 +315,14 @@ Scope Document:
     def ask(
         self,
         question: str,
+        stream: bool = True,
         on_token: Optional[Callable[[str], None]] = None,
     ) -> str:
         """Ask a planning-related question."""
         self.conversation.add("user", question)
         response = self.engine.chat(
             self.conversation,
-            stream=bool(on_token),
+            stream=stream and bool(on_token),
             on_token=on_token,
         )
         self.conversation.add("assistant", response)
@@ -357,4 +357,4 @@ Scope Document:
     @staticmethod
     def list_templates() -> Dict[str, str]:
         """List available plan templates."""
-        return {k: v["name"] for k, v in PLAN_TEMPLATES.items()}
+        return {k: str(v["name"]) for k, v in PLAN_TEMPLATES.items()}

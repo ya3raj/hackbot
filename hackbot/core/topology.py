@@ -12,7 +12,7 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional
 
 
 # ── Data Models ──────────────────────────────────────────────────────────────
@@ -92,6 +92,9 @@ class NetworkTopology:
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), indent=2)
+
+    def to_mermaid(self) -> str:
+        return TopologyParser.render_mermaid(self)
 
 
 # ── Topology Parser ──────────────────────────────────────────────────────────
@@ -496,6 +499,61 @@ class TopologyParser:
         return "\n".join(lines)
 
     @staticmethod
+    def render_mermaid(topo: NetworkTopology) -> str:
+        """
+        Render a network topology as an interactive Mermaid diagram.
+        """
+        lines = [
+            "```mermaid",
+            "graph TD",
+            "    %% Styles",
+            "    classDef scanner fill:#1f6feb,stroke:#388bfd,stroke-width:2px,color:#fff;",
+            "    classDef subnet fill:#21262d,stroke:#30363d,stroke-width:1px,color:#8b949e;",
+            "    classDef host fill:#161b22,stroke:#58a6ff,stroke-width:1px,color:#c9d1d9;",
+        ]
+
+        if not topo.nodes:
+            lines.append('    empty["(No hosts discovered)"]')
+            lines.append("```")
+            return "\n".join(lines)
+
+        def safe_id(nid: str) -> str:
+            return re.sub(r"[^a-zA-Z0-9_]", "_", nid)
+
+        scanner_node = next((n for n in topo.nodes if n.node_type == "scanner"), None)
+        scanner_id = safe_id(scanner_node.id if scanner_node else "scanner")
+        scanner_label = scanner_node.label if scanner_node else "Scanner"
+        lines.append(f'    {scanner_id}["⚡ {scanner_label}"]:::scanner')
+
+        subnets = [n for n in topo.nodes if n.node_type == "subnet"]
+        for s in subnets:
+            safe_label = s.label.replace('"', "'")
+            lines.append(f'    {safe_id(s.id)}["🌐 {safe_label}"]:::subnet')
+
+        hosts = [n for n in topo.nodes if n.node_type == "host"]
+        for h in hosts:
+            open_ports = [p for p in h.ports if p.get("state") == "open"]
+            host_text = h.ip
+            if h.hostname:
+                host_text += f"<br/>({h.hostname})"
+            if open_ports:
+                port_strs = [f"{p['port']}/{p.get('protocol', 'tcp')}" for p in open_ports[:4]]
+                if len(open_ports) > 4:
+                    port_strs.append(f"+{len(open_ports)-4} more")
+                host_text += f"<br/>Ports: {', '.join(port_strs)}"
+            if h.os:
+                safe_os = h.os[:20].replace('"', "'")
+                host_text += f"<br/>OS: {safe_os}"
+            lines.append(f'    {safe_id(h.id)}["🖥️ {host_text}"]:::host')
+
+        for edge in topo.edges:
+            edge_lbl = f"|{edge.label}|" if edge.label else ""
+            lines.append(f"    {safe_id(edge.source)} -->{edge_lbl} {safe_id(edge.target)}")
+
+        lines.append("```")
+        return "\n".join(lines)
+
+    @staticmethod
     def format_markdown(topo: NetworkTopology) -> str:
         """Format topology as a markdown summary."""
         lines = []
@@ -507,6 +565,11 @@ class TopologyParser:
         lines.append(f"| Total Hosts | {stats['total_hosts']} |")
         lines.append(f"| Open Services | {stats['total_services']} |")
         lines.append(f"| Subnets | {stats['subnets']} |")
+        lines.append("")
+
+        # Network Graph (Mermaid)
+        lines.append("### Network Graph\n")
+        lines.append(TopologyParser.render_mermaid(topo))
         lines.append("")
 
         hosts = [n for n in topo.nodes if n.node_type == "host"]

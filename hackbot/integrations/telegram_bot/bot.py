@@ -19,7 +19,7 @@ import os
 import threading
 from typing import Any, Dict, Optional
 
-from hackbot.config import HackBotConfig, load_config, save_config
+from hackbot.config import HackBotConfig, load_config
 from hackbot.core.engine import AIEngine
 from hackbot.modes.chat import ChatMode
 from hackbot.modes.plan import PlanMode
@@ -32,7 +32,6 @@ from hackbot.integrations.telegram_bot.auth import (
 from hackbot.integrations.telegram_bot.constants import (
     DEFAULT_BOT_TOKEN,
     PAIR_CODE_EXPIRY,
-    SESSION_TTL,
     _TG_AVAILABLE,
 )
 from hackbot.integrations.telegram_bot.session import TelegramUserSession
@@ -136,7 +135,6 @@ class HackBotTelegram:
                 # Session expired or never authorized
                 if user_id in self.sessions:
                     del self.sessions[user_id]
-                msg = update.message or (update.callback_query and update.callback_query.message)
                 text = (
                     "🔒 <b>Session expired or not connected.</b>\n\n"
                     "Run <code>hackbot telegram</code> on your machine "
@@ -206,8 +204,8 @@ class HackBotTelegram:
     async def _get_bot_username(self) -> str:
         bot = Bot(self.token)
         me = await bot.get_me()
-        self._bot_username = me.username
-        return me.username
+        self._bot_username = str(me.username or "")
+        return self._bot_username
 
     # ── Pairing info ─────────────────────────────────────────────────────
 
@@ -249,7 +247,8 @@ class HackBotTelegram:
 
         self._running = True
         logger.info("Starting Telegram bot: @%s", self._bot_username)
-        self._app.run_polling(drop_pending_updates=True)
+        if self._app:
+            self._app.run_polling(drop_pending_updates=True)
 
     # ── Run (background) ─────────────────────────────────────────────────
 
@@ -273,7 +272,8 @@ class HackBotTelegram:
         def _run():
             self._running = True
             try:
-                self._app.run_polling(drop_pending_updates=True)
+                if self._app:
+                    self._app.run_polling(drop_pending_updates=True)
             finally:
                 self._running = False
 
@@ -287,7 +287,7 @@ class HackBotTelegram:
 
     # ── Stop ─────────────────────────────────────────────────────────────
 
-    def stop(self) -> Dict[str, str]:
+    def stop(self) -> Dict[str, Any]:
         if not self._running:
             return {"ok": False, "message": "Bot is not running"}
         self._running = False

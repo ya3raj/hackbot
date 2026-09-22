@@ -11,7 +11,6 @@ import asyncio
 import os
 import platform
 import shlex
-import shutil
 import signal
 import subprocess
 import time
@@ -737,7 +736,7 @@ class ToolRunner:
                     env=self._get_env(),
                 )
                 # Feed sudo password to the first stage if needed
-                if stdin_data_for_stage and i == 0:
+                if stdin_data_for_stage and i == 0 and proc.stdin:
                     proc.stdin.write(stdin_data_for_stage)
                     proc.stdin.close()
 

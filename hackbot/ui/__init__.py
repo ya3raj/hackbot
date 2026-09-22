@@ -8,17 +8,14 @@ and interactive prompts. Cross-platform compatible.
 from __future__ import annotations
 
 import platform
-import shutil
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from rich.console import Console
-from rich.layout import Layout
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.syntax import Syntax
 from rich.table import Table
-from rich.text import Text
 from rich.theme import Theme
 
 from hackbot import __version__
@@ -271,6 +268,8 @@ def show_help() -> None:
 [bold]Other:[/]
   /help              Show this help
   /cve               CVE / vulnerability lookup (NVD)
+  /cvss <vector>     CVSS v3.1 vector calculator & score breakdown
+  /topology          Network topology map & Mermaid graph
   /osint             OSINT reconnaissance
   /attack            MITRE ATT&CK mapping
   /vulndb            Vulnerability database queries

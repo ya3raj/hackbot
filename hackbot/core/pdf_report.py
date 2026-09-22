@@ -19,22 +19,17 @@ from __future__ import annotations
 
 import io
 import time
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 try:
     from reportlab.lib import colors
-    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT, TA_JUSTIFY
+    from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-    from reportlab.lib.units import cm, inch, mm
+    from reportlab.lib.units import cm
     from reportlab.platypus import (
-        BaseDocTemplate,
-        Frame,
         Image,
-        NextPageTemplate,
         PageBreak,
-        PageTemplate,
         Paragraph,
         SimpleDocTemplate,
         Spacer,
@@ -51,7 +46,6 @@ try:
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
 
     HAS_MATPLOTLIB = True
 except ImportError:

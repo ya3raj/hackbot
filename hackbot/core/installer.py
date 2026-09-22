@@ -86,7 +86,8 @@ class ToolInstaller:
         if not recipe:
             return None
         available = self.available_managers()
-        order = recipe.get("order") or [k for k in recipe if k != "order"]
+        raw_order = recipe.get("order")
+        order: list[str] = list(raw_order) if isinstance(raw_order, (list, tuple)) else [k for k in recipe if k != "order"]
         for mgr in order:
             package = recipe.get(mgr)
             if package and mgr in available:
@@ -102,10 +103,11 @@ class ToolInstaller:
     def install(self, plan: InstallPlan) -> InstallResult:
         # Execute pre_install commands if defined in the recipe
         recipe = self.install_map.get(plan.tool.lower(), {})
-        pre_install = recipe.get("pre_install", [])
+        raw_pre = recipe.get("pre_install", [])
+        pre_install: list[str] = list(raw_pre) if isinstance(raw_pre, (list, tuple)) else []
         for pre_cmd in pre_install:
             self.runner.execute(
-                pre_cmd,
+                str(pre_cmd),
                 tool_name="pre-install",
                 explanation=f"Pre-install step for {plan.tool}",
                 allow_install_drivers=True,

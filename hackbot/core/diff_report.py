@@ -171,8 +171,8 @@ class DiffReport:
             "",
             "## Comparison Overview",
             "",
-            f"| | Baseline | Current |",
-            f"|---|---|---|",
+            "| | Baseline | Current |",
+            "|---|---|---|",
             f"| **Session** | {self.old_session_name or self.old_session_id} | {self.new_session_name or self.new_session_id} |",
             f"| **Date** | {old_ts} | {new_ts} |",
             f"| **Total Findings** | {self.total_old} | {self.total_new} |",
@@ -566,7 +566,8 @@ def load_session_findings(session_id: str, sessions_dir: Optional[Path] = None) 
     if path.exists():
         try:
             with open(path) as f:
-                return json.load(f)
+                data = json.load(f)
+                return data if isinstance(data, dict) else None
         except (json.JSONDecodeError, IOError):
             return None
 
@@ -575,7 +576,8 @@ def load_session_findings(session_id: str, sessions_dir: Optional[Path] = None) 
     if matches:
         try:
             with open(matches[0]) as f:
-                return json.load(f)
+                data = json.load(f)
+                return data if isinstance(data, dict) else None
         except (json.JSONDecodeError, IOError):
             return None
 

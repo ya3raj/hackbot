@@ -40,12 +40,9 @@ Usage (Agent)::
 
 from __future__ import annotations
 
-import http.client
-import io
 import json
 import logging
 import re
-import socket
 import ssl
 import threading
 import time
@@ -304,7 +301,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
 
         # Parse URL
         parsed = urllib.parse.urlparse(self.path)
-        host = parsed.hostname or self.headers.get("Host", "")
+        host = str(parsed.hostname or self.headers.get("Host") or "")
         path = parsed.path or "/"
         if parsed.query:
             path += f"?{parsed.query}"
@@ -432,7 +429,7 @@ class ProxyEngine:
     Thread-safe for concurrent request handling.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._traffic: List[CapturedRequest] = []
         self._lock = threading.Lock()
         self._id_counter = 0
@@ -490,11 +487,12 @@ class ProxyEngine:
         if not self.is_running:
             return {"ok": False, "error": "Proxy is not running"}
 
-        try:
-            self._server.shutdown()
-            self._server.server_close()
-        except Exception as e:
-            logger.debug(f"Error during proxy shutdown: {e}")
+        if self._server:
+            try:
+                self._server.shutdown()
+                self._server.server_close()
+            except Exception as e:
+                logger.debug(f"Error during proxy shutdown: {e}")
 
         self.is_running = False
         uptime = time.time() - self._start_time
@@ -511,7 +509,7 @@ class ProxyEngine:
     def _next_id(self) -> int:
         with self._lock:
             self._id_counter += 1
-            return self._id_counter
+            return int(self._id_counter)
 
     def _record(self, req: CapturedRequest) -> None:
         """Record a captured request (thread-safe)."""
