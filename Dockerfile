@@ -14,7 +14,6 @@ ENV PATH="/root/.local/bin:/root/go/bin:${PATH}"
 
 # ── System Dependencies ──────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Networking tools
     nmap \
     netcat-openbsd \
     dnsutils \
@@ -22,20 +21,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     traceroute \
     curl \
     wget \
-    # SSL/TLS tools
     openssl \
     sslscan \
-    # Web testing
     nikto \
     dirb \
-    # Password tools
     hydra \
     john \
-    # Build tools
     git \
     build-essential \
     golang \
-    # Misc
     jq \
     && rm -rf /var/lib/apt/lists/*
 
