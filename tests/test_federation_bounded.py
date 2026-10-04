@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -133,7 +134,11 @@ def test_capabilities_attest_provider_and_hard_guarantees() -> None:
     previous = app_module._state.get("engine")
     app_module._state["engine"] = engine
     try:
-        response = app_module.app.test_client().get("/api/federation/v1/capabilities")
+        with patch.dict(os.environ, {app_module.FEDERATION_TOKEN_ENV: "test-token"}):
+            response = app_module.app.test_client().get(
+                "/api/federation/v1/capabilities",
+                headers={app_module.FEDERATION_TOKEN_HEADER: "test-token"},
+            )
     finally:
         app_module._state["engine"] = previous
     assert response.status_code == 200
@@ -150,3 +155,25 @@ def test_capabilities_attest_provider_and_hard_guarantees() -> None:
     assert osint["tls_verify"] is True
     assert osint["cross_host_redirects"] is False
     assert osint["public_targets_only"] is True
+
+
+def test_federation_endpoints_require_runtime_token() -> None:
+    pytest.importorskip("flask")
+    from hackbot.gui import app as app_module
+
+    client = app_module.app.test_client()
+    with patch.dict(os.environ, {}, clear=True):
+        missing = client.get("/api/federation/v1/capabilities")
+    with patch.dict(os.environ, {app_module.FEDERATION_TOKEN_ENV: "expected-token"}):
+        wrong = client.get(
+            "/api/federation/v1/capabilities",
+            headers={app_module.FEDERATION_TOKEN_HEADER: "wrong-token"},
+        )
+        malformed = client.get(
+            "/api/federation/v1/capabilities",
+            headers={app_module.FEDERATION_TOKEN_HEADER: " token-with-whitespace "},
+        )
+    assert missing.status_code == 401
+    assert wrong.status_code == 401
+    assert malformed.status_code == 401
+    assert missing.get_json() == {"ok": False, "error": {"code": "unauthorized"}}
