@@ -100,6 +100,27 @@ def test_bounded_get_rejects_cross_origin_redirect() -> None:
     assert session.get.call_args.kwargs["verify"] is True
 
 
+def test_public_resolution_rejects_private_or_mixed_answers() -> None:
+    private = (None, None, None, None, ("127.0.0.1", 443))
+    public = (None, None, None, None, ("93.184.216.34", 443))
+    with patch("hackbot.core.osint.socket.getaddrinfo", return_value=[public, private]):
+        with pytest.raises(RuntimeError, match="not exclusively public"):
+            OSINTEngine._require_public_resolution("example.com")
+
+
+def test_rdap_cross_origin_redirect_is_skipped_not_followed() -> None:
+    from hackbot.core.bounded import Deadline
+
+    with patch.object(
+        OSINTEngine, "_bounded_get",
+        side_effect=RuntimeError("cross-origin redirect blocked"),
+    ):
+        result = OSINTEngine._bounded_whois(
+            MagicMock(), "example.com", Deadline(5), CancellationToken(), 8, 4096,
+        )
+    assert result is None
+
+
 def test_capabilities_attest_provider_and_hard_guarantees() -> None:
     pytest.importorskip("flask")
     from hackbot.gui import app as app_module

@@ -41,6 +41,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "platformdirs>=4.0",
     "markdown-it-py>=3.0",
+    "dnspython>=2.5",
 ]
 
 [project.optional-dependencies]
