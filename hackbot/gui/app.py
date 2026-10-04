@@ -9,6 +9,7 @@ Falls back to browser mode if pywebview is not available.
 from __future__ import annotations
 
 import json
+import hmac
 import logging
 import os
 import queue
@@ -93,6 +94,30 @@ _FEDERATION_REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
 _federation_lock = threading.Lock()
 _federation_tokens: Dict[str, CancellationToken] = {}
 _MAX_FEDERATION_OPERATIONS = 8
+FEDERATION_TOKEN_ENV = "ULTRAHACKBOT_HACKBOT_API_TOKEN"
+FEDERATION_TOKEN_HEADER = "X-UltraHackBot-Token"
+
+
+def _valid_federation_token(value: str) -> bool:
+    return bool(
+        value
+        and len(value) <= 512
+        and value.isascii()
+        and value.strip() == value
+        and all(33 <= ord(character) <= 126 for character in value)
+    )
+
+
+@app.before_request
+def _authenticate_federation_request():
+    """Require a runtime-only token for every federation control endpoint."""
+    if not request.path.startswith("/api/federation/"):
+        return None
+    expected = os.environ.get(FEDERATION_TOKEN_ENV, "")
+    supplied = request.headers.get(FEDERATION_TOKEN_HEADER, "")
+    if not _valid_federation_token(expected) or not hmac.compare_digest(expected, supplied):
+        return _federation_error("unauthorized", 401)
+    return None
 
 
 def _init_state(config: HackBotConfig) -> None:
