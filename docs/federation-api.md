@@ -17,7 +17,7 @@ hackbot gui
 ```
 
 Missing, malformed, or mismatched tokens return a generic `401` before provider
-or OSINT work begins. The bounded AI operation performs one tool-free call with
+or OSINT work begins; valid tokens are compared in constant time. The bounded AI operation performs one tool-free call with
 no fallback or retry. The bounded OSINT operation accepts one public bare FQDN,
 verifies TLS, ignores ambient proxies, blocks cross-origin redirects, and applies
 one deadline plus item and response-size ceilings. Cancellation is cooperative
