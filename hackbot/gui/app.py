@@ -115,7 +115,11 @@ def _authenticate_federation_request():
         return None
     expected = os.environ.get(FEDERATION_TOKEN_ENV, "")
     supplied = request.headers.get(FEDERATION_TOKEN_HEADER, "")
-    if not _valid_federation_token(expected) or not hmac.compare_digest(expected, supplied):
+    if (
+        not _valid_federation_token(expected)
+        or not _valid_federation_token(supplied)
+        or not hmac.compare_digest(expected, supplied)
+    ):
         return _federation_error("unauthorized", 401)
     return None
 
