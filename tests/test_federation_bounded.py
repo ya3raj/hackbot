@@ -169,6 +169,11 @@ def test_federation_endpoints_require_runtime_token() -> None:
             "/api/federation/v1/capabilities",
             headers={app_module.FEDERATION_TOKEN_HEADER: "wrong-token"},
         )
+        malformed = client.get(
+            "/api/federation/v1/capabilities",
+            headers={app_module.FEDERATION_TOKEN_HEADER: " token-with-whitespace "},
+        )
     assert missing.status_code == 401
     assert wrong.status_code == 401
+    assert malformed.status_code == 401
     assert missing.get_json() == {"ok": False, "error": {"code": "unauthorized"}}
