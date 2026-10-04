@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 import time
 import webbrowser
@@ -22,10 +23,29 @@ from flask import Flask, Response, jsonify, render_template, request, stream_wit
 
 from hackbot import __version__
 from hackbot.config import HackBotConfig, detect_platform, detect_tools, save_config
-from hackbot.core.engine import AIEngine, PROVIDERS, SUPPORTED_LANGUAGES
+from hackbot.core.engine import (
+    AIEngine,
+    MAX_BOUNDED_AI_INPUT_CHARS,
+    MAX_BOUNDED_AI_OUTPUT_TOKENS,
+    MAX_BOUNDED_AI_RUNTIME_SECONDS,
+    PROVIDERS,
+    SUPPORTED_LANGUAGES,
+)
+from hackbot.core.bounded import (
+    CancellationToken,
+    OperationCancelled,
+    OperationDeadlineExceeded,
+    OperationLimitExceeded,
+)
 from hackbot.core.cve import CVELookup
 from hackbot.core.compliance import ComplianceMapper
-from hackbot.core.osint import OSINTEngine
+from hackbot.core.osint import (
+    BOUNDED_OSINT_STAGES,
+    MAX_BOUNDED_OSINT_ITEMS_PER_STAGE,
+    MAX_BOUNDED_OSINT_RESPONSE_BYTES,
+    MAX_BOUNDED_OSINT_RUNTIME_SECONDS,
+    OSINTEngine,
+)
 from hackbot.core.topology import TopologyParser
 from hackbot.core.pdf_report import PDFReportGenerator, HAS_REPORTLAB
 from hackbot.core.diff_report import DiffEngine, list_agent_sessions, load_session_findings
@@ -67,6 +87,13 @@ _state: Dict[str, Any] = {
     "mode": "chat",
 }
 
+FEDERATION_PROTOCOL = "hackbot-federation"
+FEDERATION_PROTOCOL_VERSION = "1.0"
+_FEDERATION_REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
+_federation_lock = threading.Lock()
+_federation_tokens: Dict[str, CancellationToken] = {}
+_MAX_FEDERATION_OPERATIONS = 8
+
 
 def _init_state(config: HackBotConfig) -> None:
     """Initialize the global application state."""
@@ -103,6 +130,185 @@ def api_status():
         "platform": detect_platform(),
         "agent_active": _state["agent"] is not None and _state["agent"].is_running,
     })
+
+
+def _federation_error(code: str, status: int):
+    """Return a stable error without reflecting native/provider exception text."""
+    return jsonify({"ok": False, "error": {"code": code}}), status
+
+
+def _federation_json(max_body_bytes: int) -> Optional[Dict[str, Any]]:
+    content_length = request.content_length
+    if content_length is not None and content_length > max_body_bytes:
+        return None
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else None
+
+
+def _federation_begin(request_id: Any) -> Optional[CancellationToken]:
+    if not isinstance(request_id, str) or not _FEDERATION_REQUEST_ID.fullmatch(request_id):
+        return None
+    with _federation_lock:
+        if request_id in _federation_tokens or len(_federation_tokens) >= _MAX_FEDERATION_OPERATIONS:
+            return None
+        token = CancellationToken()
+        _federation_tokens[request_id] = token
+        return token
+
+
+def _federation_end(request_id: str, token: CancellationToken) -> None:
+    with _federation_lock:
+        if _federation_tokens.get(request_id) is token:
+            _federation_tokens.pop(request_id, None)
+
+
+@app.route("/api/federation/v1/capabilities")
+def api_federation_capabilities():
+    """Exact, versioned attestation consumed by the combined control plane."""
+    engine = _state.get("engine")
+    provider = (
+        engine.bounded_provider_identity()
+        if isinstance(engine, AIEngine)
+        else {"name": "", "model": "", "origin": ""}
+    )
+    return jsonify({
+        "protocol": FEDERATION_PROTOCOL,
+        "protocol_version": FEDERATION_PROTOCOL_VERSION,
+        "engine": {"name": "hackbot", "version": __version__},
+        "capabilities": {
+            "ai-one-shot": {
+                "version": "1",
+                "max_input_chars": MAX_BOUNDED_AI_INPUT_CHARS,
+                "max_output_tokens": MAX_BOUNDED_AI_OUTPUT_TOKENS,
+                "max_runtime_seconds": MAX_BOUNDED_AI_RUNTIME_SECONDS,
+                "tools": False,
+                "retry_or_fallback": False,
+                "cancel": True,
+                "provider": provider,
+            },
+            "osint-full": {
+                "version": "1",
+                "stages": list(BOUNDED_OSINT_STAGES),
+                "max_stages": len(BOUNDED_OSINT_STAGES),
+                "max_items_per_stage": MAX_BOUNDED_OSINT_ITEMS_PER_STAGE,
+                "max_response_bytes": MAX_BOUNDED_OSINT_RESPONSE_BYTES,
+                "max_runtime_seconds": MAX_BOUNDED_OSINT_RUNTIME_SECONDS,
+                "tls_verify": True,
+                "cross_host_redirects": False,
+                "public_targets_only": True,
+                "cancel": True,
+            },
+        },
+    })
+
+
+@app.route("/api/federation/v1/ai/one-shot", methods=["POST"])
+def api_federation_ai_one_shot():
+    """Execute the explicit bounded one-shot AI capability."""
+    data = _federation_json(32_768)
+    allowed = {
+        "enabled", "request_id", "prompt", "system", "max_input_chars",
+        "max_output_tokens", "timeout_seconds",
+    }
+    if data is None or set(data) - allowed or set(("enabled", "request_id", "prompt")) - set(data):
+        return _federation_error("invalid_request", 400)
+    request_id = data.get("request_id")
+    token = _federation_begin(request_id)
+    if token is None:
+        return _federation_error("request_unavailable", 409)
+    try:
+        engine: AIEngine = _state["engine"]
+        if engine is None or not engine.is_configured():
+            return _federation_error("provider_not_configured", 409)
+        result = engine.bounded_one_shot(
+            data.get("prompt"),
+            enabled=data.get("enabled"),
+            system=data.get("system", ""),
+            max_input_chars=data.get("max_input_chars", 8_192),
+            max_output_tokens=data.get("max_output_tokens", 512),
+            timeout_seconds=data.get("timeout_seconds", 30.0),
+            cancellation=token,
+        )
+        return jsonify({
+            "ok": True,
+            "capability": "ai-one-shot",
+            "version": "1",
+            "request_id": request_id,
+            "result": result.to_dict(),
+        })
+    except OperationCancelled:
+        return _federation_error("operation_cancelled", 409)
+    except OperationDeadlineExceeded:
+        return _federation_error("deadline_exceeded", 504)
+    except OperationLimitExceeded:
+        return _federation_error("limit_exceeded", 413)
+    except (TypeError, ValueError):
+        return _federation_error("invalid_request", 400)
+    except Exception:
+        return _federation_error("provider_failed", 502)
+    finally:
+        _federation_end(str(request_id), token)
+
+
+@app.route("/api/federation/v1/osint/full", methods=["POST"])
+def api_federation_osint_full():
+    """Execute the explicit bounded five-stage OSINT capability."""
+    data = _federation_json(4_096)
+    allowed = {
+        "enabled", "request_id", "target", "max_items_per_stage",
+        "max_response_bytes", "deadline_seconds",
+    }
+    if data is None or set(data) - allowed or set(("enabled", "request_id", "target")) - set(data):
+        return _federation_error("invalid_request", 400)
+    request_id = data.get("request_id")
+    token = _federation_begin(request_id)
+    if token is None:
+        return _federation_error("request_unavailable", 409)
+    try:
+        result = OSINTEngine().full_scan_bounded(
+            data.get("target"),
+            enabled=data.get("enabled"),
+            max_items_per_stage=data.get("max_items_per_stage", 64),
+            max_response_bytes=data.get("max_response_bytes", 262_144),
+            deadline_seconds=data.get("deadline_seconds", 30.0),
+            cancellation=token,
+        )
+        return jsonify({
+            "ok": True,
+            "capability": "osint-full",
+            "version": "1",
+            "request_id": request_id,
+            "result": result.to_dict(),
+        })
+    except OperationCancelled:
+        return _federation_error("operation_cancelled", 409)
+    except OperationDeadlineExceeded:
+        return _federation_error("deadline_exceeded", 504)
+    except OperationLimitExceeded:
+        return _federation_error("limit_exceeded", 413)
+    except (TypeError, ValueError):
+        return _federation_error("invalid_request", 400)
+    except Exception:
+        return _federation_error("osint_failed", 502)
+    finally:
+        _federation_end(str(request_id), token)
+
+
+@app.route("/api/federation/v1/cancel", methods=["POST"])
+def api_federation_cancel():
+    """Cancel an active federation request by its caller-chosen request ID."""
+    data = _federation_json(1_024)
+    if data is None or set(data) != {"request_id"}:
+        return _federation_error("invalid_request", 400)
+    request_id = data.get("request_id")
+    if not isinstance(request_id, str) or not _FEDERATION_REQUEST_ID.fullmatch(request_id):
+        return _federation_error("invalid_request", 400)
+    with _federation_lock:
+        token = _federation_tokens.get(request_id)
+    if token is None:
+        return _federation_error("request_not_active", 404)
+    token.cancel()
+    return jsonify({"ok": True, "request_id": request_id, "cancelled": True})
 
 
 @app.route("/api/providers")

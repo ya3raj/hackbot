@@ -8,15 +8,31 @@ WHOIS lookup, DNS records, technology stack fingerprinting.
 from __future__ import annotations
 
 import json
+import ipaddress
 import re
 import socket
 import ssl
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
+
+from hackbot.core.bounded import (
+    CancellationToken,
+    Deadline,
+    OperationCancelled,
+    OperationDeadlineExceeded,
+    OperationLimitExceeded,
+)
+
+
+MAX_BOUNDED_OSINT_STAGES = 5
+MAX_BOUNDED_OSINT_ITEMS_PER_STAGE = 128
+MAX_BOUNDED_OSINT_RESPONSE_BYTES = 524_288
+MAX_BOUNDED_OSINT_RUNTIME_SECONDS = 60.0
+BOUNDED_OSINT_STAGES = ("subdomains", "dns", "whois", "techstack", "emails")
 
 # ── Data Models ──────────────────────────────────────────────────────────────
 
@@ -131,6 +147,22 @@ class OSINTReport:
             "tech_stack": self.tech_stack.to_dict() if self.tech_stack else None,
             "emails": self.emails,
             "timestamp": self.timestamp,
+        }
+
+
+@dataclass(frozen=True)
+class BoundedOSINTResult:
+    """A complete bounded scan plus execution metadata."""
+
+    report: OSINTReport
+    completed_stages: List[str]
+    elapsed_seconds: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "report": self.report.to_dict(),
+            "completed_stages": list(self.completed_stages),
+            "elapsed_seconds": self.elapsed_seconds,
         }
 
 
@@ -690,6 +722,408 @@ class OSINTEngine:
         progress("emails", f"Found {len(report.emails)} emails")
 
         return report
+
+    # ── Explicit bounded federation scan ────────────────────────────────
+
+    @staticmethod
+    def strict_domain(target: str) -> str:
+        """Canonicalize a bare DNS hostname and reject URL/IP ambiguity."""
+        if not isinstance(target, str) or not target or target != target.strip():
+            raise ValueError("target must be a non-empty bare hostname")
+        if any(char in target for char in ("/", "\\", "@", ":", "?", "#")):
+            raise ValueError("target must be a bare hostname")
+        candidate = target[:-1] if target.endswith(".") else target
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("IP literals are not accepted by full OSINT")
+        try:
+            canonical = candidate.encode("idna").decode("ascii").lower()
+        except UnicodeError as exc:
+            raise ValueError("target is not a valid IDNA hostname") from exc
+        if len(canonical) > 253 or "." not in canonical:
+            raise ValueError("target must be a fully qualified hostname")
+        labels = canonical.split(".")
+        if any(
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or re.fullmatch(r"[a-z0-9-]+", label) is None
+            for label in labels
+        ):
+            raise ValueError("target is not a valid hostname")
+        return canonical
+
+    @staticmethod
+    def _bounded_origin(url: str) -> tuple[str, str, int]:
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("bounded OSINT requires credential-free HTTPS URLs")
+        return (parsed.scheme, parsed.hostname.encode("idna").decode("ascii").lower(), parsed.port or 443)
+
+    @staticmethod
+    def _require_public_resolution(host: str) -> None:
+        """Fail closed when a user-selected hostname resolves off the public Internet."""
+        try:
+            infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise RuntimeError("target DNS resolution failed") from exc
+        addresses = set()
+        for info in infos:
+            try:
+                addresses.add(ipaddress.ip_address(info[4][0]))
+            except (ValueError, IndexError, TypeError):
+                continue
+        if not addresses or any(not address.is_global for address in addresses):
+            raise RuntimeError("target DNS resolution is not exclusively public")
+
+    @classmethod
+    def _bounded_get(
+        cls,
+        session: requests.Session,
+        url: str,
+        deadline: Deadline,
+        cancellation: CancellationToken,
+        max_bytes: int,
+    ) -> tuple[requests.Response, bytes]:
+        """GET with TLS verification, exact-origin redirects, and response caps."""
+        pinned_origin = cls._bounded_origin(url)
+        current = url
+        for _ in range(4):
+            remaining = deadline.remaining(cancellation)
+            response = session.get(
+                current,
+                timeout=(min(3.0, remaining), min(3.0, remaining)),
+                allow_redirects=False,
+                verify=True,
+                stream=True,
+            )
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location", "")
+                response.close()
+                if not location:
+                    raise RuntimeError("upstream redirect was invalid")
+                redirected = urljoin(current, location)
+                if cls._bounded_origin(redirected) != pinned_origin:
+                    raise RuntimeError("cross-origin redirect blocked")
+                current = redirected
+                continue
+            content_length = response.headers.get("Content-Length", "")
+            if content_length.isdigit() and int(content_length) > max_bytes:
+                response.close()
+                raise OperationLimitExceeded("upstream response exceeds the configured limit")
+            body = bytearray()
+            try:
+                for chunk in response.iter_content(chunk_size=8192):
+                    deadline.remaining(cancellation)
+                    if not chunk:
+                        continue
+                    body.extend(chunk)
+                    if len(body) > max_bytes:
+                        raise OperationLimitExceeded(
+                            "upstream response exceeds the configured limit"
+                        )
+            except Exception:
+                response.close()
+                raise
+            return response, bytes(body)
+        raise RuntimeError("too many same-origin redirects")
+
+    @classmethod
+    def _bounded_subdomains(
+        cls,
+        session: requests.Session,
+        domain: str,
+        deadline: Deadline,
+        cancellation: CancellationToken,
+        max_items: int,
+        max_bytes: int,
+    ) -> List[SubdomainResult]:
+        response, body = cls._bounded_get(
+            session,
+            f"https://crt.sh/?q=%25.{domain}&output=json",
+            deadline,
+            cancellation,
+            max_bytes,
+        )
+        try:
+            if not response.ok:
+                return []
+            data = json.loads(body.decode("utf-8"))
+        finally:
+            response.close()
+        if not isinstance(data, list):
+            raise RuntimeError("certificate source returned an invalid schema")
+        found: Set[str] = set()
+        for entry in data:
+            deadline.remaining(cancellation)
+            if not isinstance(entry, dict) or not isinstance(entry.get("name_value"), str):
+                continue
+            for value in entry["name_value"].splitlines():
+                value = value.strip().lower().lstrip("*.")
+                try:
+                    canonical = cls.strict_domain(value)
+                except ValueError:
+                    continue
+                if canonical == domain or canonical.endswith(f".{domain}"):
+                    found.add(canonical)
+                if len(found) >= max_items:
+                    break
+            if len(found) >= max_items:
+                break
+        return [SubdomainResult(item, source="crt.sh") for item in sorted(found)]
+
+    @staticmethod
+    def _bounded_dns(
+        domain: str,
+        deadline: Deadline,
+        cancellation: CancellationToken,
+        max_items: int,
+    ) -> List[DNSRecord]:
+        records: List[DNSRecord] = []
+        try:
+            import dns.exception
+            import dns.resolver
+        except ImportError:
+            return records
+        resolver = dns.resolver.Resolver()
+        for record_type in ("A", "AAAA", "MX", "NS", "TXT", "CNAME", "SOA", "SRV"):
+            remaining = deadline.remaining(cancellation)
+            resolver.timeout = min(2.0, remaining)
+            resolver.lifetime = min(2.0, remaining)
+            try:
+                answers = resolver.resolve(domain, record_type)
+            except (
+                dns.resolver.NoAnswer,
+                dns.resolver.NXDOMAIN,
+                dns.resolver.NoNameservers,
+                dns.exception.Timeout,
+            ):
+                continue
+            for answer in answers:
+                deadline.remaining(cancellation)
+                records.append(
+                    DNSRecord(
+                        record_type=record_type,
+                        value=str(answer)[:2048],
+                        ttl=answers.rrset.ttl if answers.rrset else 0,
+                    )
+                )
+                if len(records) >= max_items:
+                    return records
+        return records
+
+    @classmethod
+    def _bounded_whois(
+        cls,
+        session: requests.Session,
+        domain: str,
+        deadline: Deadline,
+        cancellation: CancellationToken,
+        max_items: int,
+        max_bytes: int,
+    ) -> Optional[WHOISResult]:
+        response, body = cls._bounded_get(
+            session,
+            f"https://rdap.org/domain/{domain}",
+            deadline,
+            cancellation,
+            max_bytes,
+        )
+        try:
+            if not response.ok:
+                return None
+            data = json.loads(body.decode("utf-8"))
+        finally:
+            response.close()
+        if not isinstance(data, dict):
+            raise RuntimeError("RDAP source returned an invalid schema")
+        result = WHOISResult(domain=domain)
+        entities = data.get("entities", [])
+        if isinstance(entities, list):
+            for entity in entities[:max_items]:
+                if not isinstance(entity, dict) or "registrar" not in entity.get("roles", []):
+                    continue
+                vcard = entity.get("vcardArray")
+                rows = vcard[1] if isinstance(vcard, list) and len(vcard) > 1 and isinstance(vcard[1], list) else []
+                for row in rows[:max_items]:
+                    if isinstance(row, list) and len(row) > 3 and row[0] == "fn":
+                        result.registrar = str(row[3])[:512]
+                        break
+        events = data.get("events", [])
+        if isinstance(events, list):
+            for event in events[:max_items]:
+                if not isinstance(event, dict):
+                    continue
+                action = event.get("eventAction")
+                date = str(event.get("eventDate", ""))[:10]
+                if action == "registration":
+                    result.creation_date = date
+                elif action == "expiration":
+                    result.expiration_date = date
+                elif action == "last changed":
+                    result.updated_date = date
+        nameservers = data.get("nameservers", [])
+        if isinstance(nameservers, list):
+            for item in nameservers[:max_items]:
+                if isinstance(item, dict) and isinstance(item.get("ldhName"), str):
+                    result.name_servers.append(item["ldhName"][:253])
+        statuses = data.get("status", [])
+        if isinstance(statuses, list):
+            result.status = [str(item)[:128] for item in statuses[:max_items]]
+        return result
+
+    @classmethod
+    def _bounded_tech_and_emails(
+        cls,
+        session: requests.Session,
+        domain: str,
+        deadline: Deadline,
+        cancellation: CancellationToken,
+        max_items: int,
+        max_bytes: int,
+    ) -> tuple[TechStackResult, List[str]]:
+        cls._require_public_resolution(domain)
+        url = f"https://{domain}/"
+        response, body = cls._bounded_get(
+            session, url, deadline, cancellation, max_bytes
+        )
+        try:
+            result = TechStackResult(url=response.url or url)
+            if not response.ok:
+                return result, []
+            for key, value in list(response.headers.items())[:32]:
+                result.headers[str(key)[:128]] = str(value)[:1024]
+            result.server = result.headers.get("Server", "")
+            result.powered_by = result.headers.get("X-Powered-By", "")
+            for cookie in list(response.cookies)[:max_items]:
+                result.cookies.append(str(cookie.name)[:256])
+        finally:
+            response.close()
+        html = body.decode("utf-8", errors="replace")
+        for header_name, patterns in TECH_FINGERPRINTS["headers"].items():
+            header_value = result.headers.get(header_name, "")
+            for pattern, tech in patterns.items():
+                if header_value and (not pattern or pattern.lower() in header_value.lower()):
+                    result.technologies.append(
+                        {
+                            "name": tech["name"],
+                            "category": tech["category"],
+                            "evidence": f"Header: {header_name}: {header_value[:100]}",
+                        }
+                    )
+        for pattern, tech in TECH_FINGERPRINTS["html"].items():
+            if pattern.lower() in html.lower():
+                result.technologies.append(
+                    {
+                        "name": tech["name"],
+                        "category": tech["category"],
+                        "evidence": f"HTML content match: {pattern}",
+                    }
+                )
+            if len(result.technologies) >= max_items:
+                break
+        script_pattern = re.compile(r'<script[^>]+src=["\']([^"\']+)', re.IGNORECASE)
+        result.scripts = [item[:2048] for item in script_pattern.findall(html)[:20]]
+        email_pattern = re.compile(
+            rf"[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)*{re.escape(domain)}",
+            re.IGNORECASE,
+        )
+        emails = sorted({item.lower() for item in email_pattern.findall(html)})[:max_items]
+        return result, emails
+
+    def full_scan_bounded(
+        self,
+        target: str,
+        *,
+        enabled: bool,
+        max_items_per_stage: int = 64,
+        max_response_bytes: int = 262_144,
+        deadline_seconds: float = 30.0,
+        cancellation: Optional[CancellationToken] = None,
+    ) -> BoundedOSINTResult:
+        """Run the five-stage OSINT contract under one absolute deadline.
+
+        The bounded path uses only HTTPS sources, verifies TLS, follows redirects only
+        within the exact origin, never brute-forces subdomains, and never invokes the
+        legacy raw WHOIS or search-engine scraping fallbacks.
+        """
+        if enabled is not True:
+            raise ValueError("bounded OSINT execution requires enabled=true")
+        if (
+            isinstance(max_items_per_stage, bool)
+            or not isinstance(max_items_per_stage, int)
+            or max_items_per_stage < 1
+            or max_items_per_stage > MAX_BOUNDED_OSINT_ITEMS_PER_STAGE
+        ):
+            raise ValueError("max_items_per_stage is outside the supported range")
+        if (
+            isinstance(max_response_bytes, bool)
+            or not isinstance(max_response_bytes, int)
+            or max_response_bytes < 1024
+            or max_response_bytes > MAX_BOUNDED_OSINT_RESPONSE_BYTES
+        ):
+            raise ValueError("max_response_bytes is outside the supported range")
+        if (
+            isinstance(deadline_seconds, bool)
+            or not isinstance(deadline_seconds, (int, float))
+            or deadline_seconds <= 0
+            or deadline_seconds > MAX_BOUNDED_OSINT_RUNTIME_SECONDS
+        ):
+            raise ValueError("deadline_seconds is outside the supported range")
+
+        domain = self.strict_domain(target)
+        self._require_public_resolution(domain)
+        token = cancellation or CancellationToken()
+        deadline = Deadline(float(deadline_seconds))
+        token.raise_if_cancelled()
+        session = requests.Session()
+        session.trust_env = False
+        session.headers.update({"User-Agent": "HackBot-Federation/1.0"})
+        close_handle = token.add_callback(session.close)
+        completed: List[str] = []
+        report = OSINTReport(domain=domain)
+        try:
+            report.subdomains = self._bounded_subdomains(
+                session, domain, deadline, token, max_items_per_stage, max_response_bytes
+            )
+            completed.append("subdomains")
+            report.dns_records = self._bounded_dns(
+                domain, deadline, token, max_items_per_stage
+            )
+            completed.append("dns")
+            report.whois = self._bounded_whois(
+                session, domain, deadline, token, max_items_per_stage, max_response_bytes
+            )
+            completed.append("whois")
+            report.tech_stack, report.emails = self._bounded_tech_and_emails(
+                session, domain, deadline, token, max_items_per_stage, max_response_bytes
+            )
+            completed.extend(("techstack", "emails"))
+            deadline.remaining(token)
+            encoded = json.dumps(report.to_dict(), ensure_ascii=False).encode("utf-8")
+            if len(encoded) > max_response_bytes:
+                raise OperationLimitExceeded("OSINT report exceeds the configured limit")
+        except (OperationCancelled, OperationDeadlineExceeded, OperationLimitExceeded):
+            raise
+        except requests.RequestException as exc:
+            if token.cancelled:
+                raise OperationCancelled("operation cancelled") from exc
+            if time.monotonic() >= deadline.ends:
+                raise OperationDeadlineExceeded("operation deadline exceeded") from exc
+            raise RuntimeError("OSINT upstream request failed") from None
+        finally:
+            token.remove_callback(close_handle)
+            session.close()
+
+        return BoundedOSINTResult(
+            report=report,
+            completed_stages=completed,
+            elapsed_seconds=round(deadline.elapsed, 6),
+        )
 
     # ── Formatting ───────────────────────────────────────────────────────
 

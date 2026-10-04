@@ -7,12 +7,27 @@ Manages LLM interactions with support for multiple providers (OpenAI, Ollama, et
 from __future__ import annotations
 
 import time
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlsplit
 
-from openai import OpenAI
+from openai import DefaultHttpxClient, OpenAI
 
 from hackbot.config import AIConfig
+from hackbot.core.bounded import (
+    CancellationToken,
+    Deadline,
+    OperationCancelled,
+    OperationDeadlineExceeded,
+    OperationLimitExceeded,
+)
+
+
+MAX_BOUNDED_AI_INPUT_CHARS = 16_384
+MAX_BOUNDED_AI_OUTPUT_TOKENS = 1_024
+MAX_BOUNDED_AI_OUTPUT_CHARS = 16_384
+MAX_BOUNDED_AI_RUNTIME_SECONDS = 60.0
 
 # ── Provider Registry ────────────────────────────────────────────────────────
 
@@ -419,6 +434,38 @@ class Conversation:
         self.messages = system_msgs
 
 
+@dataclass(frozen=True)
+class BoundedAIResult:
+    """Result and provenance for a single bounded, tool-free completion."""
+
+    content: str
+    provider: str
+    requested_model: str
+    response_model: str
+    provider_origin: str
+    provider_request_id: str
+    finish_reason: str
+    input_chars: int
+    max_output_tokens: int
+    elapsed_seconds: float
+    usage: Dict[str, int] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "content": self.content,
+            "provider": self.provider,
+            "requested_model": self.requested_model,
+            "response_model": self.response_model,
+            "provider_origin": self.provider_origin,
+            "provider_request_id": self.provider_request_id,
+            "finish_reason": self.finish_reason,
+            "input_chars": self.input_chars,
+            "max_output_tokens": self.max_output_tokens,
+            "elapsed_seconds": self.elapsed_seconds,
+            "usage": dict(self.usage),
+        }
+
+
 # ── AI Engine ────────────────────────────────────────────────────────────────
 
 class AIEngine:
@@ -452,6 +499,53 @@ class AIEngine:
             kwargs["api_key"] = api_key or "local"
 
         self._client = OpenAI(**kwargs)
+
+    def _effective_base_url(self) -> str:
+        """Return the configured provider URL without ever exposing credentials."""
+        preset = PROVIDERS.get(self.config.provider, {})
+        return self.config.base_url or str(preset.get("base_url", ""))
+
+    def _provider_origin(self) -> str:
+        """Canonical provider origin used for federation provenance pinning."""
+        parsed = urlsplit(self._effective_base_url())
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return ""
+        host = parsed.hostname.lower()
+        if ":" in host:
+            host = f"[{host}]"
+        port = parsed.port
+        default_port = 443 if parsed.scheme == "https" else 80
+        port_suffix = f":{port}" if port and port != default_port else ""
+        return f"{parsed.scheme}://{host}{port_suffix}"
+
+    def bounded_provider_identity(self) -> Dict[str, str]:
+        """Return the non-secret identity bound by a bounded provider call."""
+        return {
+            "name": self.config.provider,
+            "model": self.config.model,
+            "origin": self._provider_origin(),
+        }
+
+    def _new_bounded_client(self, timeout: float) -> OpenAI:
+        """Create a private, no-retry client so cancellation cannot affect chat."""
+        provider = self.config.provider
+        api_key = self.config.api_key
+        kwargs: Dict[str, Any] = {
+            "api_key": api_key or "unused",
+            "max_retries": 0,
+            "timeout": timeout,
+            # Federation calls must not silently inherit HTTP(S)/SOCKS proxy
+            # variables that can change the effective provider route.
+            "http_client": DefaultHttpxClient(trust_env=False, timeout=timeout),
+        }
+        base_url = self._effective_base_url()
+        if base_url:
+            kwargs["base_url"] = base_url
+        if provider == "ollama":
+            kwargs["api_key"] = api_key or "ollama"
+        elif provider == "local":
+            kwargs["api_key"] = api_key or "local"
+        return OpenAI(**kwargs)
 
     @property
     def client(self) -> OpenAI:
@@ -517,6 +611,147 @@ class AIEngine:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
         return self._blocking_chat(messages)
+
+    def bounded_one_shot(
+        self,
+        prompt: str,
+        *,
+        enabled: bool,
+        system: str = "",
+        max_input_chars: int = 8_192,
+        max_output_tokens: int = 512,
+        timeout_seconds: float = 30.0,
+        cancellation: Optional[CancellationToken] = None,
+    ) -> BoundedAIResult:
+        """Run one explicitly enabled provider request with immutable hard ceilings.
+
+        This path never supplies tools, never retries or falls back to another provider,
+        and uses a private streaming client.  Cancelling closes that private client;
+        an absolute watchdog and the SDK timeout independently cap in-flight I/O.
+        Existing chat/agent methods do not call this method.
+        """
+        if enabled is not True:
+            raise ValueError("bounded AI execution requires enabled=true")
+        if not isinstance(prompt, str) or not isinstance(system, str):
+            raise TypeError("prompt and system must be strings")
+        if isinstance(max_input_chars, bool) or not isinstance(max_input_chars, int):
+            raise TypeError("max_input_chars must be an integer")
+        if max_input_chars < 1 or max_input_chars > MAX_BOUNDED_AI_INPUT_CHARS:
+            raise ValueError("max_input_chars is outside the supported range")
+        if isinstance(max_output_tokens, bool) or not isinstance(max_output_tokens, int):
+            raise TypeError("max_output_tokens must be an integer")
+        if max_output_tokens < 1 or max_output_tokens > MAX_BOUNDED_AI_OUTPUT_TOKENS:
+            raise ValueError("max_output_tokens is outside the supported range")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or timeout_seconds <= 0
+            or timeout_seconds > MAX_BOUNDED_AI_RUNTIME_SECONDS
+        ):
+            raise ValueError("timeout_seconds is outside the supported range")
+
+        input_chars = len(prompt) + len(system)
+        if input_chars > max_input_chars or input_chars > MAX_BOUNDED_AI_INPUT_CHARS:
+            raise OperationLimitExceeded("AI input exceeds the configured limit")
+
+        token = cancellation or CancellationToken()
+        deadline = Deadline(float(timeout_seconds))
+        token.raise_if_cancelled()
+        client = self._new_bounded_client(deadline.remaining(token))
+        close_handle = token.add_callback(client.close)
+        watchdog = threading.Timer(deadline.remaining(token), client.close)
+        watchdog.daemon = True
+        watchdog.start()
+        stream: Any = None
+        chunks: List[str] = []
+        output_chars = 0
+        response_model = ""
+        request_id = ""
+        finish_reason = ""
+        usage: Dict[str, int] = {}
+
+        messages: List[Dict[str, str]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        try:
+            # max_tokens and stream are passed atomically on the only provider call.
+            # No tools/tool_choice field is ever provided by this interface.
+            stream = client.chat.completions.create(
+                model=self.config.model,
+                messages=messages,
+                temperature=self.config.temperature,
+                max_tokens=max_output_tokens,
+                stream=True,
+                timeout=deadline.remaining(token),
+            )
+            for chunk in stream:
+                deadline.remaining(token)
+                response_model = str(getattr(chunk, "model", "") or response_model)
+                request_id = str(getattr(chunk, "id", "") or request_id)
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                        value = getattr(chunk_usage, key, None)
+                        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                            usage[key] = value
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                reason = getattr(choice, "finish_reason", None)
+                if reason:
+                    finish_reason = str(reason)
+                delta = getattr(choice, "delta", None)
+                text = getattr(delta, "content", None) if delta is not None else None
+                if not text:
+                    continue
+                if not isinstance(text, str):
+                    raise OperationLimitExceeded("provider returned invalid output")
+                output_chars += len(text)
+                if output_chars > MAX_BOUNDED_AI_OUTPUT_CHARS:
+                    raise OperationLimitExceeded("AI output exceeds the hard character limit")
+                chunks.append(text)
+            deadline.remaining(token)
+        except (OperationCancelled, OperationDeadlineExceeded, OperationLimitExceeded):
+            raise
+        except Exception as exc:
+            if token.cancelled:
+                raise OperationCancelled("operation cancelled") from exc
+            if time.monotonic() >= deadline.ends:
+                raise OperationDeadlineExceeded("operation deadline exceeded") from exc
+            # Provider exceptions can contain request bodies or credentials.  Do not
+            # preserve their text in the stable native error surface.
+            raise RuntimeError("provider request failed") from None
+        finally:
+            watchdog.cancel()
+            token.remove_callback(close_handle)
+            if stream is not None:
+                close_stream = getattr(stream, "close", None)
+                if callable(close_stream):
+                    try:
+                        close_stream()
+                    except Exception:
+                        pass
+            try:
+                client.close()
+            except Exception:
+                pass
+
+        return BoundedAIResult(
+            content="".join(chunks),
+            provider=self.config.provider,
+            requested_model=self.config.model,
+            response_model=response_model or self.config.model,
+            provider_origin=self._provider_origin(),
+            provider_request_id=request_id,
+            finish_reason=finish_reason,
+            input_chars=input_chars,
+            max_output_tokens=max_output_tokens,
+            elapsed_seconds=round(deadline.elapsed, 6),
+            usage=usage,
+        )
 
     def is_configured(self) -> bool:
         """Check if API key or custom base URL is set."""
