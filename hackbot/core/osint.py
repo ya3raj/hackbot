@@ -926,13 +926,21 @@ class OSINTEngine:
         max_items: int,
         max_bytes: int,
     ) -> Optional[WHOISResult]:
-        response, body = cls._bounded_get(
-            session,
-            f"https://rdap.org/domain/{domain}",
-            deadline,
-            cancellation,
-            max_bytes,
-        )
+        try:
+            response, body = cls._bounded_get(
+                session,
+                f"https://rdap.org/domain/{domain}",
+                deadline,
+                cancellation,
+                max_bytes,
+            )
+        except RuntimeError as exc:
+            # rdap.org commonly redirects to the authoritative registry.  The
+            # bounded contract never follows that cross-origin redirect; treat
+            # registration data as unavailable while completing the stage.
+            if str(exc) == "cross-origin redirect blocked":
+                return None
+            raise
         try:
             if not response.ok:
                 return None
