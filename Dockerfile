@@ -13,7 +13,8 @@ ENV PYTHONUNBUFFERED=1
 ENV PATH="/root/.local/bin:/root/go/bin:${PATH}"
 
 # ── System Dependencies ──────────────────────────────────────────────────────
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's/Components: main$/Components: main non-free/' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
     nmap \
     netcat-openbsd \
     dnsutils \
