@@ -29,6 +29,7 @@ RUN sed -i 's/Components: main$/Components: main non-free/' /etc/apt/sources.lis
     dirb \
     hydra \
     john \
+    wfuzz \
     git \
     build-essential \
     golang \
@@ -43,7 +44,7 @@ RUN go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest 2>/dev/nu
     && go install github.com/tomnomnom/waybackurls@latest 2>/dev/null || true
 
 # ── Python tools ─────────────────────────────────────────────────────────────
-RUN pip install --no-cache-dir setuptools sqlmap wfuzz
+RUN pip install --no-cache-dir setuptools sqlmap
 
 # ── HackBot Installation ────────────────────────────────────────────────────
 WORKDIR /app
