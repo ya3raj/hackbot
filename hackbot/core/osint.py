@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urljoin, urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from hackbot.core.bounded import (
     CancellationToken,
@@ -33,6 +34,50 @@ MAX_BOUNDED_OSINT_ITEMS_PER_STAGE = 128
 MAX_BOUNDED_OSINT_RESPONSE_BYTES = 524_288
 MAX_BOUNDED_OSINT_RUNTIME_SECONDS = 60.0
 BOUNDED_OSINT_STAGES = ("subdomains", "dns", "whois", "techstack", "emails")
+
+
+class _PublicPinnedHTTPSAdapter(HTTPAdapter):
+    """Resolve every request and connect only to the checked public address.
+
+    Requests normally resolves again when it opens the socket, which leaves a
+    gap between a public-address preflight and the actual destination. Keep the
+    URL hostname for TLS SNI, certificate checks, and the HTTP Host header.
+    """
+
+    def _public_pool(self, url: str, proxies: dict | None):
+        if proxies:
+            raise RuntimeError("bounded OSINT does not use proxies")
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("bounded OSINT requires credential-free HTTPS URLs")
+        host = parsed.hostname.encode("idna").decode("ascii").lower()
+        port = parsed.port or 443
+        try:
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+            addresses = {ipaddress.ip_address(info[4][0]) for info in infos}
+        except (OSError, ValueError, IndexError, TypeError) as exc:
+            raise RuntimeError("bounded OSINT destination resolution failed") from exc
+        if not addresses or any(not address.is_global for address in addresses):
+            raise RuntimeError("bounded OSINT destination is not exclusively public")
+        address = sorted(addresses, key=lambda item: (item.version, int(item)))[0]
+        return self.poolmanager.connection_from_host(
+            address.compressed, port, scheme="https",
+            pool_kwargs={"server_hostname": host, "assert_hostname": host},
+        )
+
+    def get_connection(self, url: str, proxies: dict | None = None):
+        return self._public_pool(url, proxies)
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        return self._public_pool(request.url, proxies)
+
+    def add_headers(self, request, **kwargs) -> None:
+        super().add_headers(request, **kwargs)
+        parsed = urlparse(request.url)
+        host = parsed.hostname
+        if host is None:
+            raise ValueError("bounded OSINT URL has no hostname")
+        request.headers["Host"] = host if parsed.port in (None, 443) else f"{host}:{parsed.port}"
 
 # ── Data Models ──────────────────────────────────────────────────────────────
 
@@ -1090,6 +1135,7 @@ class OSINTEngine:
         token.raise_if_cancelled()
         session = requests.Session()
         session.trust_env = False
+        session.mount("https://", _PublicPinnedHTTPSAdapter())
         session.headers.update({"User-Agent": "HackBot-Federation/1.0"})
         close_handle = token.add_callback(session.close)
         completed: List[str] = []

@@ -21,6 +21,7 @@ RUN sed -i 's/Components: main$/Components: main non-free/' /etc/apt/sources.lis
     whois \
     traceroute \
     curl \
+    libcurl4-openssl-dev \
     wget \
     openssl \
     sslscan \
