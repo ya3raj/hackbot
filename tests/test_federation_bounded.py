@@ -11,7 +11,7 @@ import pytest
 from hackbot.config import AIConfig
 from hackbot.core.bounded import CancellationToken, OperationCancelled
 from hackbot.core.engine import AIEngine
-from hackbot.core.osint import OSINTEngine
+from hackbot.core.osint import OSINTEngine, _PublicPinnedHTTPSAdapter
 
 
 class _Stream(list):
@@ -107,6 +107,25 @@ def test_public_resolution_rejects_private_or_mixed_answers() -> None:
     with patch("hackbot.core.osint.socket.getaddrinfo", return_value=[public, private]):
         with pytest.raises(RuntimeError, match="not exclusively public"):
             OSINTEngine._require_public_resolution("example.com")
+
+
+def test_bounded_https_connects_to_checked_address_without_second_dns_lookup() -> None:
+    import requests
+
+    adapter = _PublicPinnedHTTPSAdapter()
+    request = requests.Request("GET", "https://example.com/path").prepare()
+    public = (None, None, None, None, ("93.184.216.34", 443))
+    private = (None, None, None, None, ("127.0.0.1", 443))
+    with patch("hackbot.core.osint.socket.getaddrinfo", side_effect=[[public], [private]]):
+        pool = adapter.get_connection_with_tls_context(request, verify=True)
+        assert pool.host == "93.184.216.34"
+        assert pool.conn_kw["server_hostname"] == "example.com"
+        assert pool.assert_hostname == "example.com"
+        with pytest.raises(RuntimeError, match="not exclusively public"):
+            adapter.get_connection_with_tls_context(request, verify=True)
+    adapter.add_headers(request)
+    assert request.headers["Host"] == "example.com"
+    adapter.close()
 
 
 def test_rdap_cross_origin_redirect_is_skipped_not_followed() -> None:

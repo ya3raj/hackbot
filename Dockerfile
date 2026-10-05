@@ -13,29 +13,26 @@ ENV PYTHONUNBUFFERED=1
 ENV PATH="/root/.local/bin:/root/go/bin:${PATH}"
 
 # ── System Dependencies ──────────────────────────────────────────────────────
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Networking tools
+RUN sed -i 's/Components: main$/Components: main non-free/' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
     nmap \
     netcat-openbsd \
     dnsutils \
     whois \
     traceroute \
     curl \
+    libcurl4-openssl-dev \
     wget \
-    # SSL/TLS tools
     openssl \
     sslscan \
-    # Web testing
     nikto \
     dirb \
-    # Password tools
     hydra \
     john \
-    # Build tools
+    wfuzz \
     git \
     build-essential \
     golang \
-    # Misc
     jq \
     && rm -rf /var/lib/apt/lists/*
 
@@ -47,7 +44,7 @@ RUN go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest 2>/dev/nu
     && go install github.com/tomnomnom/waybackurls@latest 2>/dev/null || true
 
 # ── Python tools ─────────────────────────────────────────────────────────────
-RUN pip install --no-cache-dir setuptools sqlmap wfuzz
+RUN pip install --no-cache-dir setuptools sqlmap
 
 # ── HackBot Installation ────────────────────────────────────────────────────
 WORKDIR /app
